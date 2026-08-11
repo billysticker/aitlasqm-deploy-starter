@@ -1,0 +1,163 @@
+diff --git a/plugins/web-ui/src/memory.ts b/plugins/web-ui/src/memory.ts
+index cddef5a..25faa85 100644
+--- a/plugins/web-ui/src/memory.ts
++++ b/plugins/web-ui/src/memory.ts
+@@ -1,5 +1,5 @@
+ import { html, nothing, render } from "lit";
+-import { Clock3, Pencil, RefreshCw, Search, Trash2 } from "lucide";
++import { Building2, Clock3, Pencil, RefreshCw, Search, Send, Trash2, UserRoundCheck } from "lucide";
+ import { api, ApiError } from "./core-bridge";
+ import { errMessage } from "../../chassis/src/errors";
+ import { icon } from "./ui";
+@@ -24,6 +24,9 @@ let search = "";
+ let historyOpen = false;
+ let history: RevisionRow[] = [];
+ let memoryConfirmation: { title: string; body: string; action: string; run: () => Promise<void> } | null = null;
++let memoryShareDialog:
++  | { kind: "suggest" | "handoff"; fact: string; recipient: string; note: string; neededBy: string; pending: boolean }
++  | null = null;
+ 
+ export function resetMemoryState(): void {
+   memoryDraft = "";
+@@ -37,6 +40,7 @@ export function resetMemoryState(): void {
+   historyOpen = false;
+   history = [];
+   memoryConfirmation = null;
++  memoryShareDialog = null;
+ }
+ 
+ function facts(content: string): Array<{ line: number; text: string; date?: string }> {
+@@ -97,6 +101,10 @@ function drawMemory(loading = false): void {
+       </div>
+       ${memoryNotice || loading ? html`<div class="status">${memoryNotice || "Loading…"}</div>` : nothing}
+       <div class="memory-editor">
++        <div class="memory-privacy-note">
++          ${icon(Building2, 17)}
++          <div><strong>Private stays private.</strong><span>Suggest only the work facts your team should know. A reviewer decides what reaches company memory.</span></div>
++        </div>
+         <p class="memory-help">
+           Edit the notebook directly. Switch to Facts view to search or remove individual facts. Saves are protected if
+           the agent remembers something new while this page is open.
+@@ -136,15 +144,23 @@ function drawMemory(loading = false): void {
+                                 <div>${fact.text}</div>
+                                 ${fact.date ? html`<div class="card-meta">Captured ${fact.date}</div>` : nothing}
+                               </div>
+-                              <button
+-                                class="icon-btn"
+-                                type="button"
+-                                aria-label="Forget this fact"
+-                                title="Forget this fact"
+-                                @click=${() => removeFact(fact.line)}
+-                              >
+-                                ${icon(Trash2, 15)}
+-                              </button>
++                              <div class="memory-fact-actions">
++                                <button class="btn compact" type="button" @click=${() => openMemoryShare("suggest", fact.text)}>
++                                  ${icon(Building2, 14)} Suggest to company
++                                </button>
++                                <button class="btn compact" type="button" @click=${() => openMemoryShare("handoff", fact.text)}>
++                                  ${icon(UserRoundCheck, 14)} Handoff
++                                </button>
++                                <button
++                                  class="icon-btn"
++                                  type="button"
++                                  aria-label="Forget this fact"
++                                  title="Forget this fact"
++                                  @click=${() => removeFact(fact.line)}
++                                >
++                                  ${icon(Trash2, 15)}
++                                </button>
++                              </div>
+                             </div>`,
+                         )
+                       : html`<div class="empty-state">
+@@ -212,6 +228,7 @@ function drawMemory(loading = false): void {
+               </section>`
+             : nothing
+         }
++        ${memoryShareDialog ? memoryShareDialogView() : nothing}
+       </div>
+     `,
+     host,
+@@ -219,6 +236,81 @@ function drawMemory(loading = false): void {
+   replacePanePreservingFocus(host);
+ }
+ 
++function openMemoryShare(kind: "suggest" | "handoff", fact: string): void {
++  memoryShareDialog = { kind, fact, recipient: "", note: fact, neededBy: "", pending: false };
++  drawMemory();
++}
++
++function closeMemoryShare(): void {
++  if (memoryShareDialog?.pending) return;
++  memoryShareDialog = null;
++  drawMemory();
++}
++
++function memoryShareDialogView() {
++  const draft = memoryShareDialog!;
++  const suggestion = draft.kind === "suggest";
++  return html`<div class="memory-share-scrim" @click=${(event: MouseEvent) => event.target === event.currentTarget && closeMemoryShare()}>
++    <form
++      class="memory-share-dialog"
++      role="dialog"
++      aria-modal="true"
++      aria-labelledby="memory-share-title"
++      @submit=${(event: Event) => {
++        event.preventDefault();
++        void submitMemoryShare();
++      }}
++    >
++      <div class="own-connections-eyebrow">${suggestion ? "Company memory suggestion" : "Team handoff"}</div>
++      <h2 id="memory-share-title">${suggestion ? "Suggest this to the company" : "Hand this work to a teammate"}</h2>
++      <p>${suggestion ? "This sends a suggestion for review. It does not automatically copy your private memory." : "The teammate receives a private handoff with only the note below."}</p>
++      ${suggestion
++        ? html`<div class="memory-share-preview">${draft.fact}</div>`
++        : html`
++            <label>Teammate<input required maxlength="120" placeholder="Name or work email" .value=${draft.recipient} @input=${(event: Event) => {
++              draft.recipient = (event.target as HTMLInputElement).value;
++            }} /></label>
++            <label>Needed by<input type="date" .value=${draft.neededBy} @input=${(event: Event) => {
++              draft.neededBy = (event.target as HTMLInputElement).value;
++            }} /></label>
++            <label>Handoff note<textarea required maxlength="1000" .value=${draft.note} @input=${(event: Event) => {
++              draft.note = (event.target as HTMLTextAreaElement).value;
++            }}></textarea></label>
++          `}
++      <div class="actions">
++        <button class="btn" type="button" ?disabled=${draft.pending} @click=${closeMemoryShare}>Cancel</button>
++        <button class="btn primary" type="submit" ?disabled=${draft.pending}>
++          ${icon(Send, 14)} ${draft.pending ? "Sending…" : suggestion ? "Send suggestion" : "Send handoff"}
++        </button>
++      </div>
++    </form>
++  </div>`;
++}
++
++async function submitMemoryShare(): Promise<void> {
++  const draft = memoryShareDialog;
++  if (!draft || draft.pending) return;
++  draft.pending = true;
++  drawMemory();
++  try {
++    if (draft.kind === "suggest") {
++      await api("/api/aitlas/memory/suggest", { method: "POST", body: JSON.stringify({ fact: draft.fact }) });
++      memoryNotice = "Suggestion sent for company review. Your private memory is unchanged.";
++    } else {
++      await api("/api/aitlas/handoff", {
++        method: "POST",
++        body: JSON.stringify({ recipient: draft.recipient, note: draft.note, neededBy: draft.neededBy }),
++      });
++      memoryNotice = "Private handoff sent.";
++    }
++    memoryShareDialog = null;
++  } catch (error) {
++    memoryNotice = errMessage(error, draft.kind === "suggest" ? "Could not send that suggestion." : "Could not send that handoff.");
++    draft.pending = false;
++  }
++  drawMemory();
++}
++
+ export async function renderMemory(force = false): Promise<void> {
+   if (appState.currentView !== "memory") return;
+   const dirty = memoryLoaded && memoryDraft !== memorySaved;

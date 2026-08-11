@@ -1,0 +1,353 @@
+diff --git a/plugins/web-ui/src/personal-connections.ts b/plugins/web-ui/src/personal-connections.ts
+new file mode 100644
+index 0000000..3d3f433
+--- /dev/null
++++ b/plugins/web-ui/src/personal-connections.ts
+@@ -0,0 +1,347 @@
++import { html, nothing, render } from "lit";
++import { Check, ExternalLink, LockKeyhole, Plug, Plus, RefreshCw, Search, Send } from "lucide";
++import { api } from "./core-bridge";
++import { errMessage } from "../../chassis/src/errors";
++import { appState, replacePanePreservingFocus } from "./shell";
++import { icon } from "./ui";
++
++interface Toolkit {
++  slug: string;
++  name: string;
++  logo: string | null;
++  description: string;
++  connectable: boolean;
++  setupRequired: boolean;
++}
++
++interface Connection {
++  toolkit: string;
++  status: string;
++  active: boolean;
++}
++
++let toolkits: Toolkit[] = [];
++let connections: Connection[] = [];
++let query = "";
++let filter: "all" | "connected" = "all";
++let loading = false;
++let notice = "";
++let activeAction = "";
++let visibleCount = 36;
++let requestOpen = false;
++let requestedToolkit = "";
++let requestReason = "";
++let focusBound = false;
++
++export function resetPersonalConnectionsState(): void {
++  toolkits = [];
++  connections = [];
++  query = "";
++  filter = "all";
++  loading = false;
++  notice = "";
++  activeAction = "";
++  visibleCount = 36;
++  requestOpen = false;
++  requestedToolkit = "";
++  requestReason = "";
++}
++
++function countFor(slug: string): number {
++  return connections.filter((connection) => connection.active && connection.toolkit.toLowerCase() === slug).length;
++}
++
++function initials(name: string): string {
++  return name
++    .split(/\s+/)
++    .slice(0, 2)
++    .map((part) => part[0] ?? "")
++    .join("")
++    .toUpperCase();
++}
++
++function appLogo(toolkit: Toolkit) {
++  return toolkit.logo
++    ? html`<img class="own-connection-logo" src=${toolkit.logo} alt="" loading="lazy" />`
++    : html`<span class="own-connection-logo fallback" aria-hidden="true">${initials(toolkit.name)}</span>`;
++}
++
++function draw(): void {
++  if (appState.currentView !== "connections" || !appState.mainEl) return;
++  const needle = query.trim().toLowerCase();
++  const matched = toolkits.filter((toolkit) => {
++    if (filter === "connected" && countFor(toolkit.slug) === 0) return false;
++    return !needle || `${toolkit.name} ${toolkit.slug} ${toolkit.description}`.toLowerCase().includes(needle);
++  });
++  const visible = matched.slice(0, visibleCount);
++  const host = document.createElement("div");
++  host.className = "pane own-connections-pane";
++  render(
++    html`
++      <div class="own-connections-hero">
++        <div class="own-connections-hero-mark">${icon(LockKeyhole, 20)}</div>
++        <div>
++          <div class="own-connections-eyebrow">Your private workspace</div>
++          <h1>Add your own connections</h1>
++          <p>Connect the work accounts you want AitlasQM to use for you. Teammates cannot see or use them.</p>
++        </div>
++      </div>
++      <div class="own-connections-toolbar">
++        <div class="own-connections-tabs" role="tablist" aria-label="Connection filter">
++          <button
++            type="button"
++            role="tab"
++            aria-selected=${filter === "all" ? "true" : "false"}
++            class=${filter === "all" ? "active" : ""}
++            @click=${() => {
++              filter = "all";
++              visibleCount = 36;
++              draw();
++            }}
++          >All</button>
++          <button
++            type="button"
++            role="tab"
++            aria-selected=${filter === "connected" ? "true" : "false"}
++            class=${filter === "connected" ? "active" : ""}
++            @click=${() => {
++              filter = "connected";
++              visibleCount = 36;
++              draw();
++            }}
++          >Connected</button>
++        </div>
++        <label class="own-connections-search">
++          ${icon(Search, 17)}
++          <span class="sr-only">Search apps</span>
++          <input
++            type="search"
++            placeholder="Search apps"
++            .value=${query}
++            @input=${(event: Event) => {
++              query = (event.target as HTMLInputElement).value;
++              visibleCount = 36;
++              draw();
++            }}
++          />
++        </label>
++        <button
++          class="btn own-connections-request"
++          type="button"
++          @click=${() => {
++            requestedToolkit = query.trim();
++            requestOpen = true;
++            draw();
++          }}
++        >${icon(Plus, 16)} Request an app</button>
++      </div>
++      ${notice ? html`<div class="status own-connections-notice" role="status">${notice}</div>` : nothing}
++      ${
++        loading
++          ? html`<div class="empty-state">Loading your apps…</div>`
++          : visible.length
++            ? html`<div class="own-connections-grid">
++                ${visible.map((toolkit) => {
++                  const connected = countFor(toolkit.slug);
++                  const busy = activeAction === toolkit.slug;
++                  const syncable = connected > 0 && (toolkit.slug === "gmail" || toolkit.slug === "fathom");
++                  return html`<article class="own-connection-card ${connected ? "connected" : ""}">
++                    <div class="own-connection-main">
++                      ${appLogo(toolkit)}
++                      <div class="own-connection-copy">
++                        <div class="own-connection-title-row">
++                          <h2>${toolkit.name}</h2>
++                          ${connected ? html`<span class="own-connection-shield" title="Connected">${icon(Check, 13)}</span>` : nothing}
++                        </div>
++                        <p>${toolkit.description || `Connect your ${toolkit.name} account.`}</p>
++                      </div>
++                    </div>
++                    <div class="own-connection-foot">
++                      <span class=${connected ? "own-connection-count active" : "own-connection-count"}>
++                        ${connected ? `${connected} active` : toolkit.setupRequired ? "Admin setup needed" : "Not connected"}
++                      </span>
++                      ${
++                        syncable
++                          ? html`<button class="btn" type="button" ?disabled=${busy} @click=${() => void syncNow(toolkit)}>
++                              ${icon(RefreshCw, 15)} ${busy ? "Starting…" : "Sync now"}
++                            </button>`
++                          : connected
++                            ? html`<button class="btn" type="button" disabled>${icon(Check, 15)} Connected</button>`
++                            : toolkit.connectable
++                              ? html`<button class="btn primary" type="button" ?disabled=${busy} @click=${() => void connect(toolkit)}>
++                                  ${icon(ExternalLink, 15)} ${busy ? "Opening…" : "Connect"}
++                                </button>`
++                              : html`<button class="btn" type="button" @click=${() => openRequest(toolkit)}>
++                                  ${icon(Send, 15)} Request setup
++                                </button>`
++                      }
++                    </div>
++                  </article>`;
++                })}
++              </div>
++              ${visible.length < matched.length
++                ? html`<div class="own-connections-more"><button class="btn" type="button" @click=${() => {
++                    visibleCount += 36;
++                    draw();
++                  }}>Show more</button></div>`
++                : nothing}`
++            : html`<div class="empty-state">${filter === "connected" ? "You have not connected any apps yet." : "No apps match this search."}</div>`
++      }
++      ${requestOpen ? requestDialog() : nothing}
++    `,
++    host,
++  );
++  replacePanePreservingFocus(host);
++}
++
++function requestDialog() {
++  return html`<div class="own-connections-dialog-scrim" @click=${(event: MouseEvent) => event.target === event.currentTarget && closeRequest()}>
++    <form class="own-connections-dialog" @submit=${(event: Event) => {
++      event.preventDefault();
++      void requestApp();
++    }}>
++      <div class="own-connections-eyebrow">App request</div>
++      <h2>Request an app</h2>
++      <p>An administrator will review apps that need a one-time setup.</p>
++      <label>App name<input required maxlength="80" .value=${requestedToolkit} @input=${(event: Event) => {
++        requestedToolkit = (event.target as HTMLInputElement).value;
++      }} /></label>
++      <label>What do you need it for?<textarea maxlength="500" .value=${requestReason} @input=${(event: Event) => {
++        requestReason = (event.target as HTMLTextAreaElement).value;
++      }}></textarea></label>
++      <div class="actions">
++        <button class="btn" type="button" @click=${closeRequest}>Cancel</button>
++        <button class="btn primary" type="submit" ?disabled=${activeAction === "request"}>${activeAction === "request" ? "Sending…" : "Send request"}</button>
++      </div>
++    </form>
++  </div>`;
++}
++
++function closeRequest(): void {
++  requestOpen = false;
++  requestReason = "";
++  draw();
++}
++
++function openRequest(toolkit: Toolkit): void {
++  requestedToolkit = toolkit.name;
++  requestOpen = true;
++  draw();
++}
++
++async function requestApp(): Promise<void> {
++  if (!requestedToolkit.trim() || activeAction) return;
++  activeAction = "request";
++  draw();
++  try {
++    await api("/api/aitlas/connections/request", {
++      method: "POST",
++      body: JSON.stringify({ toolkit: requestedToolkit.trim(), reason: requestReason.trim() }),
++    });
++    requestOpen = false;
++    requestedToolkit = "";
++    requestReason = "";
++    notice = "Request sent to the administrator.";
++  } catch (error) {
++    notice = errMessage(error, "Could not send that request.");
++  } finally {
++    activeAction = "";
++    draw();
++  }
++}
++
++async function connect(toolkit: Toolkit): Promise<void> {
++  if (activeAction) return;
++  activeAction = toolkit.slug;
++  notice = "";
++  const popup = window.open("about:blank", "_blank");
++  if (popup) popup.opener = null;
++  draw();
++  try {
++    const result = await api<{ connectUrl?: string }>("/api/aitlas/connections/connect", {
++      method: "POST",
++      body: JSON.stringify({ toolkit: toolkit.slug }),
++    });
++    if (!result.connectUrl) throw new Error("No connection link was returned.");
++    if (popup) popup.location.replace(result.connectUrl);
++    else window.location.assign(result.connectUrl);
++    notice = `Finish connecting ${toolkit.name} in the new tab, then return here.`;
++    void pollForConnection(toolkit.slug, 20);
++  } catch (error) {
++    popup?.close();
++    notice = errMessage(error, `Could not connect ${toolkit.name}.`);
++  } finally {
++    activeAction = "";
++    draw();
++  }
++}
++
++async function syncNow(toolkit: Toolkit): Promise<void> {
++  if (activeAction) return;
++  activeAction = toolkit.slug;
++  notice = "";
++  draw();
++  try {
++    await api("/api/aitlas/connections/sync", {
++      method: "POST",
++      body: JSON.stringify({ toolkit: toolkit.slug }),
++    });
++    notice = `${toolkit.name} sync started. Future updates will run automatically.`;
++  } catch (error) {
++    notice = errMessage(error, `Could not start the ${toolkit.name} sync.`);
++  } finally {
++    activeAction = "";
++    draw();
++  }
++}
++
++async function loadConnections(): Promise<void> {
++  const result = await api<{ connections?: Connection[] }>("/api/aitlas/connections");
++  connections = result.connections ?? [];
++}
++
++async function pollForConnection(slug: string, attempts: number): Promise<void> {
++  for (let attempt = 0; attempt < attempts && appState.currentView === "connections"; attempt++) {
++    await new Promise((resolve) => window.setTimeout(resolve, 4_000));
++    try {
++      await loadConnections();
++      draw();
++      if (countFor(slug) > 0) {
++        const toolkit = toolkits.find((item) => item.slug === slug);
++        if (toolkit && (slug === "gmail" || slug === "fathom")) await syncNow(toolkit);
++        else {
++          notice = "Connection ready.";
++          draw();
++        }
++        return;
++      }
++    } catch {
++      return;
++    }
++  }
++}
++
++export async function renderPersonalConnections(): Promise<void> {
++  if (appState.currentView !== "connections") return;
++  if (!focusBound) {
++    focusBound = true;
++    window.addEventListener("focus", () => {
++      if (appState.currentView === "connections") void loadConnections().then(draw).catch(() => {});
++    });
++  }
++  loading = true;
++  notice = "";
++  draw();
++  try {
++    const [catalog] = await Promise.all([
++      api<{ toolkits?: Toolkit[] }>("/api/aitlas/connections/catalog"),
++      loadConnections(),
++    ]);
++    toolkits = catalog.toolkits ?? [];
++  } catch (error) {
++    notice = errMessage(error, "Could not load your apps.");
++  } finally {
++    loading = false;
++    draw();
++  }
++}

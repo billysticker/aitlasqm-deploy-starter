@@ -1,0 +1,64 @@
+diff --git a/plugins/web-ui/src/shell.ts b/plugins/web-ui/src/shell.ts
+index 776d313..943357c 100644
+--- a/plugins/web-ui/src/shell.ts
++++ b/plugins/web-ui/src/shell.ts
+@@ -11,6 +11,7 @@ import {
+   LogOut,
+   MessageSquare,
+   PanelLeft,
++  Plug,
+   Plus,
+   RefreshCw,
+   Rocket,
+@@ -69,6 +70,7 @@ import { clearConnectorNotice, noteConnectorResult, renderConnectors, resetKeych
+ import { renderDeploys } from "./deploys";
+ import { renderMemory, resetMemoryState } from "./memory";
+ import { renderSkills } from "./skills";
++import { renderPersonalConnections, resetPersonalConnectionsState } from "./personal-connections";
+ import { contextsState, ensureContexts, renderContexts, resetContextsState } from "./contexts";
+ import { appState, isView, type AuthMode, type Me, type View } from "./shell-state";
+ import { trapDialogFocus } from "./dialog-focus";
+@@ -187,6 +189,7 @@ const ICON = {
+   contexts: Folder,
+   files: Files,
+   keychain: KeyRound,
++  connections: Plug,
+   deploys: Rocket,
+   crons: Clock,
+   memory: Brain,
+@@ -211,6 +214,7 @@ export async function signOut(): Promise<void> {
+   resetMemoryState();
+   resetContextsState();
+   resetKeychainState();
++  resetPersonalConnectionsState();
+   resetComposer();
+   if (!portal) {
+     renderAuthGate({ kind: "dev" });
+@@ -546,6 +550,7 @@ export function renderSidebarTop(): void {
+           html`
+             ${navRow("contexts", ICON.contexts, "Projects")} ${navRow("chats", ICON.chats, "Chats")}
+             ${navRow("files", ICON.files, "Files")} ${navRow("crons", ICON.crons, "Crons")}
++            ${navRow("connections", ICON.connections, "Add your own connections")}
+             ${navRow("keychain", ICON.keychain, "Keychain")} ${navRow("deploys", ICON.deploys, "Apps")}
+             ${navRow("memory", ICON.memory, "Memory")} ${navRow("skills", ICON.skills, "Skills")}
+           `,
+@@ -621,6 +626,9 @@ export function switchView(v: View): void {
+     case "keychain":
+       void renderConnectors();
+       break;
++    case "connections":
++      void renderPersonalConnections();
++      break;
+     case "deploys":
+       void renderDeploys();
+       break;
+@@ -652,6 +660,9 @@ function refreshActiveView(v: View): void {
+       clearConnectorNotice();
+       void renderConnectors();
+       break;
++    case "connections":
++      void renderPersonalConnections();
++      break;
+     case "deploys":
+       void renderDeploys();
+       break;

@@ -1,0 +1,71 @@
+{
+  // QM deployment contract supported by the pinned CLI in package.json.
+  "contract": 1,
+
+  // PLACEHOLDER: replace with a short lowercase customer organization slug.
+  "orgId": "replace-me",
+
+  // PLACEHOLDER: replace with the final customer-owned portal origin.
+  "publicUrl": "https://replace-me-portal.fly.dev",
+
+  // This teaching starter is intentionally scaffolded for Fly.io.
+  "target": "fly",
+
+  // The customer owns this provider account and its usage charges.
+  "modelProvider": "openrouter",
+
+  // PLACEHOLDER: globally unique prefix for this customer's Fly apps.
+  "appPrefix": "replace-me",
+
+  // PLACEHOLDERS: confirm both with the customer before qm plan or qm up.
+  "region": "sjc",
+  "flyOrg": "replace-me",
+
+  // Slack is both an agent surface and the OIDC sign-in provider in this example.
+  "services": ["core", "slack", "web-ui", "admin", "portal"],
+
+  "plugins": [],
+  "skills": [],
+
+  "env": {
+    "core": {
+      "HARNESS": "pi",
+      "SNAPSHOT_STORE": "s3",
+      "TRANSFER_STORE": "s3",
+      "S3_BUCKET": "replace-me-data",
+      "S3_REGION": "auto"
+    },
+    "slack": {
+      "SLACK_IDENTITY_EMAIL": "1"
+    },
+    "web-ui": {
+      "AITLAS_COMPOSIO_GATEWAY_URL": "https://replace-me-gateway.fly.dev/api/qm/composio",
+      "QM_CONNECTION_REVIEWER": "admin@example.com",
+      "QM_MEMORY_REVIEWER": "admin@example.com"
+    },
+    "portal": {
+      "OIDC_AUTH_ENDPOINT": "https://slack.com/openid/connect/authorize",
+      "OIDC_TOKEN_ENDPOINT": "https://slack.com/api/openid.connect.token",
+      "OIDC_USERINFO_ENDPOINT": "https://slack.com/api/openid.connect.userInfo",
+      "OIDC_ISSUER": "https://slack.com",
+      "OIDC_JWKS_URI": "https://slack.com/openid/connect/keys",
+      "OIDC_ALLOWED_EMAILS": "admin@example.com",
+      "PORTAL_EXPECTED_TEAM_ID": "T0000000000"
+    }
+  },
+
+  // The actual admin grant lives in the ignored .env file.
+  "secretEnv": {
+    "core": {
+      "ADMIN_GRANTS": "ADMIN_GRANTS"
+    }
+  },
+
+  // No live image or digest is inherited. Publish the customer's own sandbox.
+  "sandbox": {
+    "app": "replace-me-sandboxes",
+    "env": {
+      "AITLAS_COMPOSIO_GATEWAY_URL": "https://replace-me-gateway.fly.dev/api/qm/composio"
+    }
+  }
+}

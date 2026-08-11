@@ -1,0 +1,245 @@
+diff --git a/plugins/web-ui/server/aitlas.ts b/plugins/web-ui/server/aitlas.ts
+new file mode 100644
+index 0000000..f06605c
+--- /dev/null
++++ b/plugins/web-ui/server/aitlas.ts
+@@ -0,0 +1,239 @@
++import type { IncomingMessage, ServerResponse } from "node:http";
++import { CAPABILITY_HEADER, type HttpMethod } from "../../chassis/src/core-client.ts";
++import { json, PayloadTooLargeError, readBody } from "../../chassis/src/http.ts";
++
++interface CoreResult {
++  status: number;
++  text: string;
++}
++
++interface AitlasContext {
++  user: string;
++  displayName: string | null;
++  coreFetch: (method: HttpMethod, path: string, body?: string) => Promise<CoreResult>;
++  coreFetchCap: (method: HttpMethod, path: string, body?: string) => Promise<CoreResult>;
++}
++
++function gatewayBase(): string | null {
++  const raw = process.env.AITLAS_COMPOSIO_GATEWAY_URL?.trim();
++  if (!raw) return null;
++  try {
++    const url = new URL(raw);
++    const localTest = process.env.NODE_ENV === "test" && ["localhost", "127.0.0.1"].includes(url.hostname);
++    if ((url.protocol !== "https:" && !(localTest && url.protocol === "http:")) || url.username || url.password || url.search || url.hash) return null;
++    return url.toString().replace(/\/$/, "");
++  } catch {
++    return null;
++  }
++}
++
++async function gatewayFetch(ctx: AitlasContext, method: HttpMethod, action: string, body = ""): Promise<CoreResult> {
++  const base = gatewayBase();
++  if (!base) return { status: 503, text: JSON.stringify({ error: "not_configured" }) };
++  const capability = await ctx.coreFetch("POST", "/v1/session-cap", "");
++  if (capability.status !== 200) return capability;
++  let token = "";
++  try {
++    token = String((JSON.parse(capability.text) as { token?: unknown }).token ?? "");
++  } catch {
++    token = "";
++  }
++  if (!token) return { status: 503, text: JSON.stringify({ error: "not_configured" }) };
++  try {
++    const response = await fetch(`${base}/${action}`, {
++      method,
++      headers: {
++        accept: "application/json",
++        ...(body ? { "content-type": "application/json" } : {}),
++        [CAPABILITY_HEADER]: token,
++      },
++      ...(body ? { body } : {}),
++      redirect: "manual",
++      signal: AbortSignal.timeout(15_000),
++    });
++    const text = await response.text();
++    if (text.length > 2_000_000) return { status: 502, text: JSON.stringify({ error: "bad_response" }) };
++    return { status: response.status, text };
++  } catch {
++    return { status: 503, text: JSON.stringify({ error: "unavailable" }) };
++  }
++}
++
++function relayGateway(res: ServerResponse, result: CoreResult): void {
++  if (result.status >= 200 && result.status < 300) {
++    res.writeHead(result.status, { "content-type": "application/json", "cache-control": "no-store" });
++    res.end(result.text);
++    return;
++  }
++  let code = "";
++  try {
++    code = String((JSON.parse(result.text) as { error?: unknown }).error ?? "");
++  } catch {
++    code = "";
++  }
++  if (code === "admin_setup_required") {
++    json(res, 409, { error: code, message: "This app needs a one-time administrator setup before you can connect it." });
++    return;
++  }
++  if (result.status === 401 || result.status === 403) {
++    json(res, result.status, { error: "not_allowed", message: "Open this page from your personal workspace and try again." });
++    return;
++  }
++  json(res, result.status === 429 ? 429 : 503, {
++    error: "connection_unavailable",
++    message: result.status === 429 ? "Too many requests. Try again in a moment." : "Connections are temporarily unavailable.",
++  });
++}
++
++function relayDelivery(res: ServerResponse, result: CoreResult, failure: string): void {
++  if (result.status >= 200 && result.status < 300) {
++    json(res, 200, { ok: true });
++    return;
++  }
++  json(res, result.status === 400 || result.status === 404 ? result.status : 502, {
++    error: "delivery_failed",
++    message: failure,
++  });
++}
++
++function parseObject(raw: string): Record<string, unknown> | null {
++  try {
++    const value = JSON.parse(raw);
++    return value && typeof value === "object" && !Array.isArray(value) ? (value as Record<string, unknown>) : null;
++  } catch {
++    return null;
++  }
++}
++
++function field(value: unknown, max: number): string {
++  return typeof value === "string" ? value.replace(/\s+/g, " ").trim().slice(0, max) : "";
++}
++
++async function requestBody(req: IncomingMessage, res: ServerResponse): Promise<Record<string, unknown> | null> {
++  try {
++    const parsed = parseObject(await readBody(req));
++    if (!parsed) json(res, 400, { error: "bad_request", message: "Check the form and try again." });
++    return parsed;
++  } catch (error) {
++    if (error instanceof PayloadTooLargeError) throw error;
++    json(res, 400, { error: "bad_request", message: "Check the form and try again." });
++    return null;
++  }
++}
++
++export async function handleAitlasRoute(
++  req: IncomingMessage,
++  res: ServerResponse,
++  path: string,
++  method: string,
++  ctx: AitlasContext,
++): Promise<boolean> {
++  if (!path.startsWith("/api/aitlas/")) return false;
++
++  if (method === "GET" && path === "/api/aitlas/connections/catalog") {
++    relayGateway(res, await gatewayFetch(ctx, "GET", "catalog"));
++    return true;
++  }
++
++  if (method === "GET" && path === "/api/aitlas/connections") {
++    relayGateway(res, await gatewayFetch(ctx, "GET", "connections"));
++    return true;
++  }
++
++  if (method === "POST" && path === "/api/aitlas/connections/connect") {
++    const body = await requestBody(req, res);
++    if (!body) return true;
++    const toolkit = field(body.toolkit, 64).toLowerCase();
++    if (!/^[a-z0-9][a-z0-9_-]{0,63}$/.test(toolkit)) {
++      json(res, 400, { error: "bad_request", message: "Choose a valid app." });
++      return true;
++    }
++    relayGateway(res, await gatewayFetch(ctx, "POST", "connect", JSON.stringify({ toolkit })));
++    return true;
++  }
++
++  if (method === "POST" && path === "/api/aitlas/connections/sync") {
++    const body = await requestBody(req, res);
++    if (!body) return true;
++    const toolkit = field(body.toolkit, 64).toLowerCase();
++    if (toolkit !== "gmail" && toolkit !== "fathom") {
++      json(res, 400, { error: "bad_request", message: "Automatic sync is not available for this app yet." });
++      return true;
++    }
++    const threadRef = `web:${ctx.user}:connections`;
++    const turn = {
++      surface: "web",
++      actor: { externalId: ctx.user, ...(ctx.displayName ? { displayName: ctx.displayName } : {}) },
++      conversation: { kind: "dm", threadRef },
++      liveActor: true,
++      deliveryTarget: threadRef,
++      text: `Finish my private ${toolkit} setup now. Sync the initial 30-day window, ensure exactly one three-hour incremental sync is scheduled, and keep only compact summaries, dates, action items, and source links. Reply only with the number stored and whether the next sync is scheduled.`,
++    };
++    const result = await ctx.coreFetch("POST", "/v1/turns?async=1", JSON.stringify(turn));
++    if (result.status >= 200 && result.status < 300) json(res, 202, { ok: true });
++    else json(res, 502, { error: "sync_failed", message: "Could not start the sync." });
++    return true;
++  }
++
++  if (method === "POST" && path === "/api/aitlas/connections/request") {
++    const body = await requestBody(req, res);
++    if (!body) return true;
++    const toolkit = field(body.toolkit, 80);
++    const reason = field(body.reason, 500);
++    const reviewer = field(process.env.QM_CONNECTION_REVIEWER ?? process.env.QM_MEMORY_REVIEWER, 120);
++    if (!toolkit || !reviewer) {
++      json(res, reviewer ? 400 : 503, { error: "bad_request", message: reviewer ? "Name the app you need." : "No app reviewer is configured." });
++      return true;
++    }
++    const who = ctx.displayName || ctx.user;
++    const text = [`App connection request from ${who}`, `App: ${toolkit}`, reason ? `Need: ${reason}` : ""].filter(Boolean).join("\n");
++    relayDelivery(
++      res,
++      await ctx.coreFetchCap("POST", "/v1/reach", JSON.stringify({ recipient: reviewer, text })),
++      "Could not send that app request.",
++    );
++    return true;
++  }
++
++  if (method === "POST" && path === "/api/aitlas/memory/suggest") {
++    const body = await requestBody(req, res);
++    if (!body) return true;
++    const fact = field(body.fact, 1_000);
++    const reviewer = field(process.env.QM_MEMORY_REVIEWER, 120);
++    if (!fact || !reviewer) {
++      json(res, reviewer ? 400 : 503, { error: "bad_request", message: reviewer ? "Choose a memory to suggest." : "No memory reviewer is configured." });
++      return true;
++    }
++    const who = ctx.displayName || ctx.user;
++    const text = `Company memory suggestion from ${who}\nCandidate: ${fact}\nReview this for company relevance and sensitivity. Add only the approved fact; this message does not change company memory.`;
++    relayDelivery(
++      res,
++      await ctx.coreFetchCap("POST", "/v1/reach", JSON.stringify({ recipient: reviewer, text })),
++      "Could not send that memory suggestion.",
++    );
++    return true;
++  }
++
++  if (method === "POST" && path === "/api/aitlas/handoff") {
++    const body = await requestBody(req, res);
++    if (!body) return true;
++    const recipient = field(body.recipient, 120);
++    const note = field(body.note, 1_000);
++    const neededBy = field(body.neededBy, 40);
++    if (!recipient || !note) {
++      json(res, 400, { error: "bad_request", message: "Add a teammate and a handoff note." });
++      return true;
++    }
++    const who = ctx.displayName || ctx.user;
++    const text = [`Team handoff from ${who}`, neededBy ? `Needed by: ${neededBy}` : "", note].filter(Boolean).join("\n");
++    relayDelivery(
++      res,
++      await ctx.coreFetchCap("POST", "/v1/reach", JSON.stringify({ recipient, text })),
++      "Could not send that handoff. Check the teammate name and try again.",
++    );
++    return true;
++  }
++
++  json(res, 404, { error: "not_found" });
++  return true;
++}

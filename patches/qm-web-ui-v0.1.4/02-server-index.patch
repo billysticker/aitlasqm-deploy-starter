@@ -1,0 +1,29 @@
+diff --git a/plugins/web-ui/server/index.ts b/plugins/web-ui/server/index.ts
+index be031e1..c885b50 100644
+--- a/plugins/web-ui/server/index.ts
++++ b/plugins/web-ui/server/index.ts
+@@ -20,6 +20,7 @@ import {
+ } from "../../chassis/src/http.ts";
+ import { verifyPortalIdentity, PORTAL_IDENTITY_HEADER } from "../../chassis/src/portal-identity.ts";
+ import { createBrandingCache, injectBranding } from "../../chassis/src/branding.ts";
++import { handleAitlasRoute } from "./aitlas.ts";
+ import {
+   CORE_API_URL as CORE,
+   CORE_ORG_ID as ORG,
+@@ -780,6 +781,16 @@ const routeRequest = async (req: IncomingMessage, res: ServerResponse) => {
+       });
+     }
+ 
++    if (
++      await handleAitlasRoute(req, res, path, method, {
++        user,
++        displayName: resolveIdentity(req)?.name ?? null,
++        coreFetch,
++        coreFetchCap,
++      })
++    )
++      return;
++
+     if (method === "POST" && path === "/api/blobs") {
+       return uploadBlobFromRequest(req, res, declaredSha(url));
+     }

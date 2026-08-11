@@ -1,0 +1,13 @@
+diff --git a/plugins/web-ui/src/shell-state.ts b/plugins/web-ui/src/shell-state.ts
+index 032ce3a..9a1f003 100644
+--- a/plugins/web-ui/src/shell-state.ts
++++ b/plugins/web-ui/src/shell-state.ts
+@@ -9,7 +9,7 @@ export interface Me {
+   permissions?: string[];
+ }
+ 
+-const VIEWS = ["chats", "contexts", "crons", "files", "keychain", "deploys", "memory", "skills"] as const;
++const VIEWS = ["chats", "contexts", "crons", "files", "connections", "keychain", "deploys", "memory", "skills"] as const;
+ export type View = (typeof VIEWS)[number];
+ 
+ export function isView(view: string | null | undefined): view is View {

@@ -1,0 +1,26 @@
+{
+  "name": "aitlasqm-deploy-starter",
+  "version": "0.0.0",
+  "private": true,
+  "dependencies": {
+    "@yc-software/qm": "0.1.4"
+  },
+  "engines": {
+    "node": ">=24.0.0"
+  },
+  "scripts": {
+    "qm": "qm",
+    "check": "qm check",
+    "plan": "qm plan",
+    "deploy": "qm up",
+    "status": "qm status",
+    "conformance": "qm conformance --static",
+    "starter:audit": "node scripts/audit-starter.mjs",
+    "test:composio": "node --test test/composio-client.test.mjs",
+    "gateway:install": "npm --prefix connector-gateway ci",
+    "gateway:test": "npm --prefix connector-gateway test",
+    "gateway:build": "npm --prefix connector-gateway run build",
+    "web-ui:prepare": "node scripts/prepare-qm-web-ui.mjs",
+    "web-ui:publish": "node scripts/publish-qm-web-ui.mjs"
+  }
+}

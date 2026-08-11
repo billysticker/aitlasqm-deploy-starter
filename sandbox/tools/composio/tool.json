@@ -1,0 +1,14 @@
+{
+  "id": "composio",
+  "label": "Composio",
+  "advertise": "composio",
+  "hints": [
+    "Use composio connect <toolkit>, connections, search, read, sync, and knowledge search. The current QM capability binds every call to this exact personal or private-channel scope.",
+    "Personal connections must start in that teammate's DM or personal QM chat. Shared connections require a QM org admin in an approved private channel.",
+    "Only read-only tools are executable. Drafting, sending, deleting, publishing, and invitations are refused by the gateway.",
+    "Never ask for or print a Composio API key. Connector credentials remain in the dedicated server-side Composio project."
+  ],
+  "egress": ["replace-me-gateway.fly.dev"],
+  "approvals": [],
+  "install": { "binary": "composio" }
+}

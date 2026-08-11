@@ -1,0 +1,9 @@
+.env
+.env.*
+!.env.example
+node_modules/
+.generated/
+connector-gateway/.next/
+*.log
+.DS_Store
+Thumbs.db

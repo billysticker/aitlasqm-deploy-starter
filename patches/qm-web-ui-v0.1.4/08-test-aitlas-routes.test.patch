@@ -1,0 +1,98 @@
+diff --git a/plugins/web-ui/test/aitlas-routes.test.ts b/plugins/web-ui/test/aitlas-routes.test.ts
+new file mode 100644
+index 0000000..1af3c8b
+--- /dev/null
++++ b/plugins/web-ui/test/aitlas-routes.test.ts
+@@ -0,0 +1,92 @@
++import assert from "node:assert/strict";
++import type { IncomingMessage, ServerResponse } from "node:http";
++import { Readable } from "node:stream";
++import { after, test } from "node:test";
++import { handleAitlasRoute } from "../server/aitlas.ts";
++
++const calls: Array<{ path: string; body: string; capability: string }> = [];
++const originalFetch = globalThis.fetch;
++
++process.env.AITLAS_COMPOSIO_GATEWAY_URL = "http://localhost/api/qm/composio";
++process.env.QM_MEMORY_REVIEWER = "reviewer@company.com";
++process.env.NODE_ENV = "test";
++
++globalThis.fetch = async (input, init) => {
++  const headers = new Headers(init?.headers);
++  calls.push({
++    path: String(input),
++    body: String(init?.body ?? ""),
++    capability: headers.get("x-agent-capability") ?? "",
++  });
++  const payload = String(input).endsWith("/catalog") ? { toolkits: [] } : { connections: [] };
++  return new Response(JSON.stringify(payload), { status: 200, headers: { "content-type": "application/json" } });
++};
++
++after(() => {
++  globalThis.fetch = originalFetch;
++});
++
++const ctx = {
++  user: "alice",
++  displayName: "Alice",
++  coreFetch: async (_method: "GET" | "POST" | "PUT" | "PATCH" | "DELETE", path: string, body = "") => {
++    if (path === "/v1/session-cap") return { status: 200, text: JSON.stringify({ token: "scope-capability" }) };
++    calls.push({ path, body, capability: "" });
++    return { status: 202, text: JSON.stringify({ runId: "run-sync" }) };
++  },
++  coreFetchCap: async (_method: "GET" | "POST" | "PUT" | "PATCH" | "DELETE", path: string, body = "") => {
++    calls.push({ path, body, capability: "scope-capability" });
++    return { status: 200, text: JSON.stringify({ ok: true }) };
++  },
++};
++
++async function request(path: string, method = "GET", body = ""): Promise<{ status: number; body: string }> {
++  const req = Readable.from(body ? [Buffer.from(body)] : []) as IncomingMessage;
++  let status = 0;
++  let responseBody = "";
++  const res = {
++    writeHead(nextStatus: number) {
++      status = nextStatus;
++      return this;
++    },
++    end(value?: string) {
++      responseBody = value ?? "";
++      return this;
++    },
++  } as unknown as ServerResponse;
++  await handleAitlasRoute(req, res, path, method, ctx);
++  return { status, body: responseBody };
++}
++
++test("keeps the scope capability server-side for the personal catalog", async () => {
++  const response = await request("/api/aitlas/connections/catalog");
++  assert.equal(response.status, 200);
++  assert.equal(calls.find((call) => call.path.endsWith("/catalog"))?.capability, "scope-capability");
++  assert.ok(!response.body.includes("scope-capability"));
++});
++
++test("sends memory as an explicit review suggestion without writing company memory", async () => {
++  const response = await request(
++    "/api/aitlas/memory/suggest",
++    "POST",
++    JSON.stringify({ fact: "Client asked to move the meeting." }),
++  );
++  assert.equal(response.status, 200);
++  const reach = calls.find((call) => call.path === "/v1/reach");
++  assert.equal(reach?.capability, "scope-capability");
++  assert.match(reach?.body ?? "", /reviewer@company\.com/);
++  assert.match(reach?.body ?? "", /does not change company memory/);
++  assert.ok(!calls.some((call) => call.path.startsWith("/v1/memory/facts")));
++});
++
++test("queues sync in the signed-in person's own web conversation", async () => {
++  const response = await request(
++    "/api/aitlas/connections/sync",
++    "POST",
++    JSON.stringify({ toolkit: "gmail" }),
++  );
++  assert.equal(response.status, 202);
++  const turn = calls.find((call) => call.path.startsWith("/v1/turns"));
++  assert.match(turn?.body ?? "", /web:alice:connections/);
++  assert.match(turn?.body ?? "", /three-hour incremental sync/);
++});

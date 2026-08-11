@@ -1,0 +1,1 @@
+Use the AitlasQM template to deploy QM, isolated sandboxes, your customer-owned Composio gateway, Connections, Unified Inbox, and Slack into your own accounts; never reuse ChiroCandy production values or connected accounts.

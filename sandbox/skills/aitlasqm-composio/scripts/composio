@@ -1,0 +1,335 @@
+#!/usr/bin/env node
+"use strict";
+
+// Synchronized into persistent QM Sprites and installed on the sandbox PATH.
+
+const { mkdirSync, chmodSync } = require("node:fs");
+const { join, resolve } = require("node:path");
+const { DatabaseSync } = require("node:sqlite");
+
+class CliError extends Error {
+  constructor(message, status = 1) {
+    super(message);
+    this.status = status;
+  }
+}
+
+function gatewayUrl(action, env = process.env) {
+  const configured = env.AITLAS_COMPOSIO_GATEWAY_URL?.trim();
+  if (!configured) throw new CliError("Composio gateway URL is not configured.");
+  let base;
+  try {
+    base = new URL(configured);
+  } catch {
+    throw new CliError("Composio gateway URL is invalid.");
+  }
+  const production = base.protocol === "https:";
+  const localTest =
+    env.NODE_ENV === "test" &&
+    base.protocol === "http:" &&
+    (base.hostname === "127.0.0.1" || base.hostname === "localhost");
+  if ((!production && !localTest) || base.username || base.password || base.search || base.hash) {
+    throw new CliError("Composio gateway URL is not approved.");
+  }
+  const path = base.pathname.replace(/\/$/, "");
+  if (!path.endsWith("/api/qm/composio")) throw new CliError("Composio gateway path is invalid.");
+  base.pathname = `${path}/${action}`;
+  return base;
+}
+
+async function apiRequest(action, options = {}, env = process.env) {
+  const token = env.AGENT_API_TOKEN;
+  if (!token) throw new CliError("This QM turn has no agent capability; use a scoped live QM conversation.");
+  let response;
+  try {
+    response = await fetch(gatewayUrl(action, env), {
+      method: options.method || "POST",
+      headers: {
+        Accept: "application/json",
+        "Content-Type": "application/json",
+        "x-agent-capability": token,
+      },
+      body: options.body === undefined ? undefined : JSON.stringify(options.body),
+      redirect: "error",
+      signal: AbortSignal.timeout(40_000),
+    });
+  } catch (error) {
+    if (error instanceof CliError) throw error;
+    throw new CliError("Composio gateway is unavailable.");
+  }
+  const text = await response.text();
+  if (text.length > 2_000_000) throw new CliError("Composio gateway response is too large.");
+  let payload;
+  try {
+    payload = JSON.parse(text);
+  } catch {
+    throw new CliError("Composio gateway returned malformed JSON.");
+  }
+  if (!payload || typeof payload !== "object" || Array.isArray(payload)) {
+    throw new CliError("Composio gateway returned an invalid response.");
+  }
+  if (!response.ok) {
+    const message = typeof payload.message === "string" ? payload.message.slice(0, 500) : "Composio request failed.";
+    throw new CliError(message, response.status);
+  }
+  return payload;
+}
+
+function takeOption(args, name) {
+  const index = args.indexOf(name);
+  if (index < 0) return undefined;
+  if (index === args.length - 1) throw new CliError(`${name} needs a value.`);
+  const value = args[index + 1];
+  args.splice(index, 2);
+  return value;
+}
+
+function jsonInput(args) {
+  const raw = takeOption(args, "--json");
+  if (raw === undefined) throw new CliError("--json '<object>' is required.");
+  try {
+    const value = JSON.parse(raw);
+    if (!value || typeof value !== "object" || Array.isArray(value)) throw new Error();
+    return value;
+  } catch {
+    throw new CliError("--json must contain a JSON object.");
+  }
+}
+
+function toolkit(value) {
+  if (typeof value !== "string" || !/^[a-z0-9][a-z0-9_-]{0,63}$/i.test(value)) {
+    throw new CliError("A valid toolkit slug is required.");
+  }
+  return value.toLowerCase();
+}
+
+function tool(value) {
+  if (typeof value !== "string" || !/^[A-Z0-9][A-Z0-9_]{2,127}$/i.test(value)) {
+    throw new CliError("A valid tool slug is required.");
+  }
+  return value.toUpperCase();
+}
+
+function knowledgePath(env = process.env) {
+  const workspace = resolve(env.AITLASQM_WORKSPACE || "/root/workspace");
+  const directory = join(workspace, ".aitlasqm");
+  mkdirSync(directory, { recursive: true, mode: 0o700 });
+  return join(directory, "knowledge.sqlite");
+}
+
+function openKnowledge(env = process.env) {
+  const path = knowledgePath(env);
+  const db = new DatabaseSync(path);
+  db.exec(`
+    PRAGMA journal_mode = WAL;
+    PRAGMA busy_timeout = 5000;
+    CREATE TABLE IF NOT EXISTS knowledge_items (
+      toolkit TEXT NOT NULL,
+      source_id TEXT NOT NULL,
+      title TEXT NOT NULL,
+      summary TEXT NOT NULL,
+      action_items TEXT NOT NULL,
+      occurred_at TEXT,
+      source_pointer TEXT NOT NULL,
+      updated_at TEXT NOT NULL,
+      PRIMARY KEY (toolkit, source_id)
+    );
+    CREATE INDEX IF NOT EXISTS knowledge_items_time ON knowledge_items (toolkit, occurred_at DESC);
+    CREATE TABLE IF NOT EXISTS sync_state (
+      toolkit TEXT PRIMARY KEY,
+      cursor TEXT NOT NULL,
+      phase TEXT NOT NULL,
+      updated_at TEXT NOT NULL
+    );
+  `);
+  try {
+    chmodSync(path, 0o600);
+  } catch {
+    // Some local test filesystems do not expose POSIX modes.
+  }
+  return db;
+}
+
+function compactRecord(value, expectedToolkit) {
+  if (!value || typeof value !== "object" || Array.isArray(value) || value.toolkit !== expectedToolkit) {
+    throw new CliError("Composio sync returned an invalid knowledge record.");
+  }
+  const bounded = (field, max, required = false) => {
+    const result = typeof value[field] === "string" ? value[field].trim().slice(0, max) : "";
+    if (required && !result) throw new CliError(`Composio sync record is missing ${field}.`);
+    return result;
+  };
+  const actionItems = Array.isArray(value.actionItems)
+    ? value.actionItems.filter((item) => typeof item === "string").slice(0, 10).map((item) => item.slice(0, 300))
+    : [];
+  return {
+    toolkit: expectedToolkit,
+    sourceId: bounded("sourceId", 256, true),
+    title: bounded("title", 200, true),
+    summary: bounded("summary", 1000),
+    actionItems,
+    occurredAt: typeof value.occurredAt === "string" && !Number.isNaN(Date.parse(value.occurredAt)) ? value.occurredAt : null,
+    sourcePointer: bounded("sourcePointer", 1000, true),
+  };
+}
+
+async function syncConnector(toolkitValue, env = process.env) {
+  const name = toolkit(toolkitValue);
+  if (name !== "gmail" && name !== "fathom") throw new CliError("V1 knowledge sync supports Gmail and Fathom.");
+  const db = openKnowledge(env);
+  try {
+    const previous = db.prepare("SELECT cursor FROM sync_state WHERE toolkit = ?").get(name);
+    const payload = await apiRequest("sync", { body: { toolkit: name, ...(previous ? { cursor: previous.cursor } : {}) } }, env);
+    if (typeof payload.cursor !== "string" || typeof payload.hasMore !== "boolean" || typeof payload.phase !== "string" || !Array.isArray(payload.records)) {
+      throw new CliError("Composio sync returned an invalid response.");
+    }
+    const records = payload.records.map((record) => compactRecord(record, name));
+    const upsert = db.prepare(`
+      INSERT INTO knowledge_items
+        (toolkit, source_id, title, summary, action_items, occurred_at, source_pointer, updated_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+      ON CONFLICT(toolkit, source_id) DO UPDATE SET
+        title = excluded.title,
+        summary = excluded.summary,
+        action_items = excluded.action_items,
+        occurred_at = excluded.occurred_at,
+        source_pointer = excluded.source_pointer,
+        updated_at = excluded.updated_at
+    `);
+    const saveState = db.prepare(`
+      INSERT INTO sync_state (toolkit, cursor, phase, updated_at) VALUES (?, ?, ?, ?)
+      ON CONFLICT(toolkit) DO UPDATE SET cursor = excluded.cursor, phase = excluded.phase, updated_at = excluded.updated_at
+    `);
+    const updatedAt = new Date().toISOString();
+    db.exec("BEGIN IMMEDIATE");
+    try {
+      for (const record of records) {
+        upsert.run(
+          record.toolkit,
+          record.sourceId,
+          record.title,
+          record.summary,
+          JSON.stringify(record.actionItems),
+          record.occurredAt,
+          record.sourcePointer,
+          updatedAt,
+        );
+      }
+      saveState.run(name, payload.cursor, payload.phase, updatedAt);
+      db.exec("COMMIT");
+    } catch (error) {
+      db.exec("ROLLBACK");
+      throw error;
+    }
+    return { toolkit: name, stored: records.length, hasMore: payload.hasMore, cursorStatus: payload.phase };
+  } finally {
+    db.close();
+  }
+}
+
+function searchKnowledge(query, env = process.env) {
+  if (typeof query !== "string" || !query.trim() || query.length > 500) throw new CliError("A knowledge search query is required.");
+  const terms = [...new Set(query.toLowerCase().split(/[^a-z0-9]+/).filter((term) => term.length > 1))].slice(0, 8);
+  if (!terms.length) throw new CliError("Knowledge search needs at least one word or number.");
+  const db = openKnowledge(env);
+  try {
+    // ponytail: bounded LIKE search is enough for the initial compact corpus; add FTS5 when measured latency warrants it.
+    const where = terms.map(() => "lower(title || ' ' || summary || ' ' || action_items) LIKE ?").join(" OR ");
+    return db
+      .prepare(
+        `SELECT toolkit, source_id, title, summary, action_items, occurred_at, source_pointer
+           FROM knowledge_items WHERE ${where}
+           ORDER BY coalesce(occurred_at, updated_at) DESC LIMIT 5`,
+      )
+      .all(...terms.map((term) => `%${term}%`))
+      .map((row) => ({
+        toolkit: row.toolkit,
+        sourceId: row.source_id,
+        title: row.title,
+        summary: row.summary,
+        actionItems: JSON.parse(row.action_items),
+        occurredAt: row.occurred_at,
+        sourcePointer: row.source_pointer,
+      }));
+  } finally {
+    db.close();
+  }
+}
+
+const HELP = `Usage:
+  composio connect <toolkit>
+  composio connections
+  composio search "<need>" [--toolkit <toolkit>]
+  composio read <tool> --json '<input>'
+  composio sync <gmail|fathom>
+  composio knowledge search "<query>"`;
+
+async function executeCommand(argv, deps = {}) {
+  const env = deps.env || process.env;
+  const write = deps.write || ((value) => process.stdout.write(`${value}\n`));
+  const args = [...argv];
+  const command = args.shift();
+  if (!command || command === "--help" || command === "help") return write(HELP);
+  if (command === "--version" || command === "version") return write("aitlas-qm-composio 1.0.0");
+
+  if (command === "connect") {
+    const name = toolkit(args.shift());
+    if (args.length) throw new CliError("Unexpected connect arguments.");
+    return write(JSON.stringify(await apiRequest("connect", { body: { toolkit: name } }, env)));
+  }
+  if (command === "connections") {
+    if (args.length) throw new CliError("connections takes no arguments.");
+    return write(JSON.stringify(await apiRequest("connections", { method: "GET" }, env)));
+  }
+  if (command === "search") {
+    const query = args.shift();
+    const filter = takeOption(args, "--toolkit");
+    if (typeof query !== "string" || !query.trim() || args.length) throw new CliError("search needs one quoted query.");
+    return write(
+      JSON.stringify(await apiRequest("search", { body: { query, ...(filter ? { toolkit: toolkit(filter) } : {}) } }, env)),
+    );
+  }
+  if (command === "read") {
+    const slug = tool(args.shift());
+    const input = jsonInput(args);
+    if (args.length) throw new CliError(`Unexpected ${command} arguments.`);
+    return write(
+      JSON.stringify(
+        await apiRequest("execute", { body: { toolSlug: slug, input, mode: "read" } }, env),
+      ),
+    );
+  }
+  if (command === "sync") {
+    const name = args.shift();
+    if (args.length) throw new CliError("sync takes one toolkit.");
+    return write(JSON.stringify(await syncConnector(name, env)));
+  }
+  if (command === "knowledge") {
+    if (args.shift() !== "search") throw new CliError("knowledge supports only: knowledge search <query>.");
+    const query = args.join(" ");
+    return write(JSON.stringify({ matches: searchKnowledge(query, env) }));
+  }
+  throw new CliError(`Unknown command: ${command}\n${HELP}`);
+}
+
+async function main() {
+  try {
+    await executeCommand(process.argv.slice(2));
+  } catch (error) {
+    const message = error instanceof CliError ? error.message : "Composio command failed.";
+    process.stderr.write(`composio: ${message}\n`);
+    process.exitCode = 1;
+  }
+}
+
+if (require.main === module) void main();
+
+module.exports = {
+  CliError,
+  apiRequest,
+  executeCommand,
+  gatewayUrl,
+  openKnowledge,
+  searchKnowledge,
+  syncConnector,
+};
