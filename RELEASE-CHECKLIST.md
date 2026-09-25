@@ -9,6 +9,10 @@
 - [ ] The pinned upstream web UI revision accepts all patches, its AitlasQM
       route/branding tests pass, its production dependency audit is clean, and
       its Vite production build succeeds.
+- [ ] Company Brain UI is described as optional until a customer-owned knowledge
+      service and grants are configured and verified.
+- [ ] Native room skill examples contain only generic instructions and are
+      described as opt-in, with no inherited credential grant.
 - [ ] A second human reviewed all tracked files for production topology and
       internal company language.
 - [ ] No `.env`, generated output, live registry image/digest, company gateway,

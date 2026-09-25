@@ -1,0 +1,359 @@
+diff --git a/plugins/admin/src/index.ts b/plugins/admin/src/index.ts
+index cc1ed26..df1c035 100644
+--- a/plugins/admin/src/index.ts
++++ b/plugins/admin/src/index.ts
+@@ -23,6 +23,8 @@ import { dirname, join } from "node:path";
+ 
+ const PORT = portFromEnv(8090);
+ const ADMIN_BASE_PATH = (process.env.ADMIN_BASE_PATH ?? "").replace(/\/$/, "");
++const PRODUCT_NAME = "AitlasQM";
++const BRAND_ACCENT = "#58bf4b";
+ const CORE_WHOAMI_ATTEMPTS = 2;
+ const CORE_WHOAMI_TIMEOUT_MS = 2_500;
+ const CORE_WHOAMI_RETRY_DELAY_MS = 250;
+@@ -76,6 +78,12 @@ async function refreshBrandNow(): Promise<void> {
+ type Shell = { key: string; html: string; gzip: Buffer; etag: string; gzipEtag: string };
+ let shellCache: Shell | null = null;
+ function brandedShell(branding: OrgBranding): Shell {
++  branding = {
++    ...branding,
++    accent: branding.accent || BRAND_ACCENT,
++    markUrl: branding.markUrl || "/aitlas-agent-icon.png",
++    selfLabel: branding.selfLabel || PRODUCT_NAME,
++  };
+   const key = JSON.stringify([branding.accent, branding.mark, branding.markUrl, branding.selfLabel]);
+   if (shellCache?.key === key) return shellCache;
+   const html = injectBranding(BASE_HTML, branding, { titleSuffix: "Admin" });
+diff --git a/plugins/web-ui/index.html b/plugins/web-ui/index.html
+index a73eb6f..36bda62 100644
+--- a/plugins/web-ui/index.html
++++ b/plugins/web-ui/index.html
+@@ -6,19 +6,19 @@
+       name="viewport"
+       content="width=device-width, initial-scale=1.0, viewport-fit=cover, interactive-widget=resizes-content"
+     />
+-    <title>QM · Web</title>
+-    <link rel="icon" href="%BASE_URL%favicon.svg" />
++    <title>AitlasQM</title>
++    <link rel="icon" type="image/png" href="%BASE_URL%aitlas-agent-icon.png" />
+     <link rel="manifest" href="%BASE_URL%manifest.webmanifest" />
+-    <link rel="apple-touch-icon" href="%BASE_URL%brand-mark.svg" />
++    <link rel="apple-touch-icon" href="%BASE_URL%aitlas-agent-icon.png" />
+     <meta name="theme-color" media="(prefers-color-scheme: light)" content="#ffffff" />
+-    <meta name="theme-color" media="(prefers-color-scheme: dark)" content="#111318" />
++    <meta name="theme-color" media="(prefers-color-scheme: dark)" content="#0b1727" />
+     <meta name="mobile-web-app-capable" content="yes" />
+     <meta name="apple-mobile-web-app-capable" content="yes" />
+     <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
+-    <meta name="apple-mobile-web-app-title" content="QM" />
++    <meta name="apple-mobile-web-app-title" content="AitlasQM" />
+     <meta name="format-detection" content="telephone=no" />
+-    <meta name="brand-self-label" content="QM" />
+-    <meta name="description" content="Web surface for the org agent: custom chat UI stitched to the platform core." />
++    <meta name="brand-self-label" content="AitlasQM" />
++    <meta name="description" content="AitlasQM — your owned AI coworker." />
+   </head>
+   <body>
+     <div id="app"></div>
+diff --git a/plugins/web-ui/server/index.ts b/plugins/web-ui/server/index.ts
+index 546ecba..0031a5b 100644
+--- a/plugins/web-ui/server/index.ts
++++ b/plugins/web-ui/server/index.ts
+@@ -78,6 +78,8 @@ export function isLoopsUser(principalId: string, configuredUsers = process.env.L
+ 
+ const ROOT = join(dirname(fileURLToPath(import.meta.url)), "..");
+ const DIST = join(ROOT, "dist-web");
++const PRODUCT_NAME = "AitlasQM";
++const BRAND_ACCENT = "#58bf4b";
+ 
+ const brandingCache = createBrandingCache(async () => {
+   const r = await coreFetch("GET", "/v1/surface-config", "", 2_000);
+@@ -94,7 +96,7 @@ const brandingCache = createBrandingCache(async () => {
+ 
+ async function serveWebManifest(res: ServerResponse): Promise<void> {
+   const branding = await brandingCache.forRender();
+-  const name = branding.selfLabel || "QM";
++  const name = PRODUCT_NAME;
+   const manifest = {
+     name,
+     short_name: name,
+@@ -103,8 +105,8 @@ async function serveWebManifest(res: ServerResponse): Promise<void> {
+     display: "standalone",
+     orientation: "any",
+     background_color: "#ffffff",
+-    theme_color: "#ffffff",
+-    icons: [{ src: "/brand-mark.svg", sizes: "any", type: "image/svg+xml", purpose: "any maskable" }],
++    theme_color: BRAND_ACCENT,
++    icons: [{ src: "/aitlas-agent-icon.png", sizes: "any", type: "image/png", purpose: "any maskable" }],
+   };
+   res.writeHead(200, { "content-type": "application/manifest+json; charset=utf-8", "cache-control": "no-cache" });
+   res.end(JSON.stringify(manifest));
+@@ -112,7 +114,15 @@ async function serveWebManifest(res: ServerResponse): Promise<void> {
+ 
+ async function brandIndexHtml(html: string): Promise<string> {
+   const branding = await brandingCache.forRender();
+-  return injectBranding(html, branding, { titleSuffix: "· Web" });
++  return injectBranding(
++    html,
++    {
++      ...branding,
++      accent: branding.accent || BRAND_ACCENT,
++      markUrl: branding.markUrl || "/aitlas-agent-icon.png",
++      selfLabel: branding.selfLabel || PRODUCT_NAME,
++    },
++  );
+ }
+ 
+ const portalTokenStore = new AsyncLocalStorage<string | undefined>();
+diff --git a/plugins/web-ui/shared.html b/plugins/web-ui/shared.html
+index 5f7e33d..95f19ec 100644
+--- a/plugins/web-ui/shared.html
++++ b/plugins/web-ui/shared.html
+@@ -4,8 +4,9 @@
+     <meta charset="UTF-8" />
+     <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover" />
+     <meta name="robots" content="noindex,nofollow" />
+-    <meta name="brand-self-label" content="QM" />
+-    <title>Shared conversation · QM</title>
++    <link rel="icon" type="image/png" href="%BASE_URL%aitlas-agent-icon.png" />
++    <meta name="brand-self-label" content="AitlasQM" />
++    <title>Shared conversation · AitlasQM</title>
+   </head>
+   <body>
+     <div id="app"></div>
+diff --git a/plugins/web-ui/src/document-title.ts b/plugins/web-ui/src/document-title.ts
+index e7cd2e8..d8aef06 100644
+--- a/plugins/web-ui/src/document-title.ts
++++ b/plugins/web-ui/src/document-title.ts
+@@ -11,17 +11,19 @@ interface ActiveConversation {
+   threadRef: string | null;
+ }
+ 
+-export const PRODUCT_TITLE = "QM · Web";
++export const PRODUCT_TITLE = "AitlasQM";
+ 
+ const VIEW_TITLES: Record<View, string> = {
+   chats: "Chats",
+   inbox: "Inbox",
++  brain: "Brain",
+   calendar: "Calendar",
+   contexts: "Projects",
+   crons: "Crons",
+   loops: "Loops",
+   webhooks: "Webhooks",
+   files: "Files",
++  connections: "Connections",
+   keychain: "Keychain",
+   deploys: "Apps",
+   memory: "Memory",
+diff --git a/plugins/web-ui/src/model-connect.ts b/plugins/web-ui/src/model-connect.ts
+index 61785fa..14fff9d 100644
+--- a/plugins/web-ui/src/model-connect.ts
++++ b/plugins/web-ui/src/model-connect.ts
+@@ -1,7 +1,7 @@
+ import { html, render, nothing, type TemplateResult } from "lit";
+ import { api } from "./core-bridge";
+ import { errMessage } from "../../chassis/src/errors";
+-import { brandMark, brandName } from "./ui";
++import { brandLogo } from "./ui";
+ import { appState } from "./shell-state";
+ import { trapDialogFocus, restoreDialogFocus } from "./dialog-focus";
+ 
+@@ -708,7 +708,7 @@ function view(): TemplateResult {
+               </button>`
+             : nothing
+         }
+-        ${s.mode === "gate" ? html`<div class="signin-brand">${brandMark()}<span>${brandName()}</span></div>` : nothing}
++        ${s.mode === "gate" ? html`<div class="signin-brand">${brandLogo()}</div>` : nothing}
+         <h1 id="mc-title">${title}</h1>
+         <p class="signin-body">${subCopy}</p>
+         ${body}
+diff --git a/plugins/web-ui/src/shared-session.ts b/plugins/web-ui/src/shared-session.ts
+index 9e3c078..0f4f5bb 100644
+--- a/plugins/web-ui/src/shared-session.ts
++++ b/plugins/web-ui/src/shared-session.ts
+@@ -6,7 +6,7 @@ import { createTranscriptViewport } from "./transcript-viewport";
+ import { decorateTextCodeBlocks } from "./text-code";
+ import { markdown } from "./message-markdown";
+ import { installMarkdownSanitizer } from "./markdown-sanitize";
+-import { brandName, brandMark, chipBadge, icon, copyText } from "./ui";
++import { brandName, brandLogo, chipBadge, icon, copyText } from "./ui";
+ 
+ interface SharedTranscript {
+   createdAt: number;
+@@ -26,7 +26,7 @@ render(
+     <div class="shared-conversation">
+       <header class="chat-topbar session-topbar">
+         <a class="shared-brand" href=${base} aria-label=${`Open ${brandName()}`}
+-          >${brandMark()}<span>${brandName()}</span></a
++          >${brandLogo()}</a
+         >
+         <div class="session-heading">
+           <span class="session-title">Shared conversation</span
+diff --git a/plugins/web-ui/src/shell.css b/plugins/web-ui/src/shell.css
+index 26dbb76..33890af 100644
+--- a/plugins/web-ui/src/shell.css
++++ b/plugins/web-ui/src/shell.css
+@@ -213,33 +213,27 @@ body.resizing-sidebar {
+   min-width: 0;
+   display: flex;
+   align-items: center;
+-  gap: 7.5px;
+   flex: 1;
+   overflow: hidden;
+ }
+ .brand-logo {
+   display: inline-flex;
+-  align-items: center;
+-  justify-content: center;
+-  width: 22px;
+-  height: 22px;
+-  flex: 0 0 22px;
+-  overflow: hidden;
+-  border-radius: 5px;
+-  background: var(--brand-accent) var(--brand-mark-image, url("./assets/brand-mark.svg")) center / cover no-repeat;
+-  color: white;
+-  font-size: 16px;
+-  font-weight: 500;
+-  line-height: 1;
++  min-width: 0;
+ }
+-.brand-mark::before {
+-  content: var(--brand-mark);
+-  display: flex;
+-  align-items: center;
+-  justify-content: center;
+-  width: 100%;
+-  height: 100%;
+-  background: var(--brand-accent);
++.brand-logo img {
++  display: block;
++  width: 152px;
++  height: auto;
++  max-width: 100%;
++}
++.brand-logo-on-dark {
++  display: none !important;
++}
++.dark .brand-logo-on-light {
++  display: none;
++}
++.dark .brand-logo-on-dark {
++  display: block !important;
+ }
+ .brand-name {
+   color: var(--foreground);
+diff --git a/plugins/web-ui/src/shell.ts b/plugins/web-ui/src/shell.ts
+index a991845..87ec70e 100644
+--- a/plugins/web-ui/src/shell.ts
++++ b/plugins/web-ui/src/shell.ts
+@@ -43,7 +43,7 @@ import {
+ } from "./core-bridge";
+ import { seedRuntimeConfig } from "./runtime-config-store";
+ import { errMessage, swallow } from "../../chassis/src/errors";
+-import { brandMark, brandName, icon } from "./ui";
++import { brandLogo, brandName, icon } from "./ui";
+ import { PHONE_MAX_WIDTH, trackVisualViewport } from "./viewport";
+ import { markConnectorConnected } from "./chat";
+ import { clearSkillsCache, resyncModelSelection } from "./composer";
+@@ -309,7 +309,7 @@ function gateShell(body: unknown) {
+     <div class="signin">
+         <div class="signin-panel">
+           <div class="signin-brand">
+-          ${brandMark()}<span>${brandName()}</span>
++          ${brandLogo()}
+           ${authMode === "dev" ? html`<span class="dev-chip">DEV</span>` : nothing}
+         </div>
+         ${body}
+@@ -491,7 +491,7 @@ export function mountShell(): void {
+           @keydown=${onSidebarKeydown}
+         >
+           <div class="brand">
+-            <div class="brand-lockup">${brandMark()}<span class="brand-name">${brandName()}</span></div>
++            <div class="brand-lockup">${brandLogo()}</div>
+             <button
+               class="icon-btn sidebar-toggle sidebar-collapse-toggle"
+               type="button"
+diff --git a/plugins/web-ui/src/ui.ts b/plugins/web-ui/src/ui.ts
+index 1135c6b..48404be 100644
+--- a/plugins/web-ui/src/ui.ts
++++ b/plugins/web-ui/src/ui.ts
+@@ -3,12 +3,15 @@ import { live } from "lit/directives/live.js";
+ import { Check, ChevronDown, Download, createElement, type IconNode } from "lucide";
+ 
+ export function brandName(): string {
+-  if (typeof document === "undefined") return "QM";
+-  return document.querySelector<HTMLMetaElement>('meta[name="brand-self-label"]')?.content || "QM";
++  if (typeof document === "undefined") return "AitlasQM";
++  return document.querySelector<HTMLMetaElement>('meta[name="brand-self-label"]')?.content || "AitlasQM";
+ }
+ 
+-export function brandMark(): TemplateResult {
+-  return html`<span class="brand-mark" aria-hidden="true"></span>`;
++export function brandLogo(): TemplateResult {
++  return html`<span class="brand-logo" role="img" aria-label="AitlasQM">
++    <img class="brand-logo-on-light" src="/aitlas-agent-logo-dark.png" alt="" width="1920" height="535" />
++    <img class="brand-logo-on-dark" src="/aitlas-agent-logo-white.png" alt="" width="1878" height="519" />
++  </span>`;
+ }
+ 
+ const SWELL_PATH =
+diff --git a/plugins/web-ui/test/branding.test.ts b/plugins/web-ui/test/branding.test.ts
+index b116d43..36e5a6c 100644
+--- a/plugins/web-ui/test/branding.test.ts
++++ b/plugins/web-ui/test/branding.test.ts
+@@ -54,9 +54,13 @@ test("cold start: the FIRST shell render already carries accent, mark, and self-
+   );
+ });
+ 
+-test("the vite template carries the self-label anchor the server injects into", () => {
++test("the vite template carries the AitlasQM identity and official assets", () => {
+   const template = readFileSync(new URL("../index.html", import.meta.url), "utf8");
+-  assert.match(template, /<meta name="brand-self-label" content="QM"\s*\/?>/);
++  const ui = readFileSync(new URL("../src/ui.ts", import.meta.url), "utf8");
++  assert.match(template, /<meta name="brand-self-label" content="AitlasQM"\s*\/?>/);
++  assert.match(template, /aitlas-agent-icon\.png/);
++  assert.match(ui, /aitlas-agent-logo-dark\.png/);
++  assert.match(ui, /aitlas-agent-logo-white\.png/);
+ });
+ 
+ test("injectBranding rewrites the tab title with the escaped label when a suffix is given", async () => {
+@@ -108,14 +112,14 @@ test("brandName() reads the injected self-label and falls back to the product na
+   } finally {
+     delete (globalThis as { document?: Document }).document;
+   }
+-  assert.equal(brandName!(), "QM");
++  assert.equal(brandName!(), "AitlasQM");
+ });
+ 
+ test("the installable-app metadata follows the brand: manifest link, touch icon, home-screen title", async () => {
+   const template = readFileSync(new URL("../index.html", import.meta.url), "utf8");
+   assert.match(template, /<link rel="manifest" href="%BASE_URL%manifest\.webmanifest"\s*\/?>/);
+-  assert.match(template, /<link rel="apple-touch-icon" href="%BASE_URL%brand-mark\.svg"\s*\/?>/);
+-  assert.match(template, /<meta name="apple-mobile-web-app-title" content="QM"\s*\/?>/);
++  assert.match(template, /<link rel="apple-touch-icon" href="%BASE_URL%aitlas-agent-icon\.png"\s*\/?>/);
++  assert.match(template, /<meta name="apple-mobile-web-app-title" content="AitlasQM"\s*\/?>/);
+   assert.match(template, /viewport-fit=cover, interactive-widget=resizes-content/);
+   const { injectBranding } = await import("../../chassis/src/branding.ts");
+   const shell =
+diff --git a/plugins/web-ui/test/ui-copy.test.ts b/plugins/web-ui/test/ui-copy.test.ts
+index f2bb7d3..7fcdbed 100644
+--- a/plugins/web-ui/test/ui-copy.test.ts
++++ b/plugins/web-ui/test/ui-copy.test.ts
+@@ -3,14 +3,14 @@ import test from "node:test";
+ import { JSDOM } from "jsdom";
+ import { brandName, copyText } from "../src/ui.ts";
+ 
+-test("brand name defaults to QM", () => {
++test("brand name defaults to AitlasQM", () => {
+   const documentDescriptor = Object.getOwnPropertyDescriptor(globalThis, "document");
+   Object.defineProperty(globalThis, "document", {
+     configurable: true,
+     value: new JSDOM("").window.document,
+   });
+   try {
+-    assert.equal(brandName(), "QM");
++    assert.equal(brandName(), "AitlasQM");
+   } finally {
+     if (documentDescriptor) Object.defineProperty(globalThis, "document", documentDescriptor);
+     else delete (globalThis as { document?: Document }).document;

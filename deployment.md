@@ -75,9 +75,10 @@ instead of adopting it by name.
 ## 5. Publish and pin the AitlasQM web UI
 
 The patch set is applied to upstream QM commit
-`7f2c916360f1797a8ff2a77ce2ce40c5fabab087`. It adds personal Connections,
-Unified Inbox, reviewed memory suggestions, and team handoffs without copying a
-live deployment image.
+`5a5cb51260b13000dda5d890d40c877c88d87555`. It adds personal Connections,
+Unified Inbox, reviewed memory suggestions, and a Brain Map UI that needs a
+separate customer-owned knowledge service. The template copies no live
+deployment image or knowledge database.
 
 ```bash
 npm run web-ui:prepare

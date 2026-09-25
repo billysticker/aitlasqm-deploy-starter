@@ -5,6 +5,9 @@
   // PLACEHOLDER: replace with a short lowercase customer organization slug.
   "orgId": "replace-me",
 
+  // Display name shared by the Slack bot and SSO app.
+  "botName": "AitlasQM",
+
   // PLACEHOLDER: replace with the final customer-owned portal origin.
   "publicUrl": "https://replace-me-portal.fly.dev",
 
@@ -41,7 +44,11 @@
     "web-ui": {
       "AITLAS_COMPOSIO_GATEWAY_URL": "https://replace-me-gateway.fly.dev/api/qm/composio",
       "QM_CONNECTION_REVIEWER": "admin@example.com",
-      "QM_MEMORY_REVIEWER": "admin@example.com"
+      "QM_MEMORY_REVIEWER": "admin@example.com",
+      "QM_BRAND_MARK_URL": "https://replace-me-portal.fly.dev/aitlas-agent-icon.png"
+    },
+    "admin": {
+      "QM_BRAND_MARK_URL": "https://replace-me-portal.fly.dev/aitlas-agent-icon.png"
     },
     "portal": {
       "OIDC_AUTH_ENDPOINT": "https://slack.com/openid/connect/authorize",

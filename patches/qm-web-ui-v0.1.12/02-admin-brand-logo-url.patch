@@ -1,0 +1,26 @@
+diff --git a/plugins/admin/src/index.ts b/plugins/admin/src/index.ts
+index df1c035..d91bab4 100644
+--- a/plugins/admin/src/index.ts
++++ b/plugins/admin/src/index.ts
+@@ -81,7 +81,7 @@ function brandedShell(branding: OrgBranding): Shell {
+   branding = {
+     ...branding,
+     accent: branding.accent || BRAND_ACCENT,
+-    markUrl: branding.markUrl || "/aitlas-agent-icon.png",
++    markUrl: branding.markUrl || (process.env.QM_BRAND_MARK_URL || "/aitlas-agent-icon.png"),
+     selfLabel: branding.selfLabel || PRODUCT_NAME,
+   };
+   const key = JSON.stringify([branding.accent, branding.mark, branding.markUrl, branding.selfLabel]);
+diff --git a/plugins/web-ui/server/index.ts b/plugins/web-ui/server/index.ts
+index 0031a5b..d7c783c 100644
+--- a/plugins/web-ui/server/index.ts
++++ b/plugins/web-ui/server/index.ts
+@@ -119,7 +119,7 @@ async function brandIndexHtml(html: string): Promise<string> {
+     {
+       ...branding,
+       accent: branding.accent || BRAND_ACCENT,
+-      markUrl: branding.markUrl || "/aitlas-agent-icon.png",
++      markUrl: branding.markUrl || (process.env.QM_BRAND_MARK_URL || "/aitlas-agent-icon.png"),
+       selfLabel: branding.selfLabel || PRODUCT_NAME,
+     },
+   );

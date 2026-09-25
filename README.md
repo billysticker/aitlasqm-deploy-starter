@@ -4,6 +4,13 @@ This public template installs a customer-owned AitlasQM stack with isolated QM
 sandboxes, Slack, a scoped Composio connector gateway, personal app connections,
 and the AitlasQM Connections and Unified Inbox web UI.
 
+The template now pins `@yc-software/qm@0.1.12`. Its reviewed UI patches are
+based on the matching upstream source revision. Customer-owned specialist room
+examples are in [`room-skills/`](./room-skills/README.md); publish them to the
+appropriate native QM room only after setting its members, tools, and review
+rules. [Company Brain adoption](./docs/COMPANY-BRAIN-ADOPTION.md) explains the
+scoped knowledge contract and the separate service it requires.
+
 It contains no ChiroCandy production URL, Fly organization, Slack workspace ID,
 credential, Composio project, private registry image, or customer data. Every
 student deploys into accounts owned by their own company.
@@ -23,6 +30,7 @@ student deploys into accounts owned by their own company.
 | `scripts/prepare-qm-web-ui.mjs` | Applies the reviewed patches to pinned upstream QM source |
 | `scripts/publish-qm-web-ui.mjs` | Builds, pushes, and pins the customer's immutable web UI image |
 | `docs/` | Current class setup manual |
+| `room-skills/` | Editable image and landing-page room examples; opt-in, not auto-installed |
 
 QM runtime source remains upstream at
 [yc-software/qm](https://github.com/yc-software/qm). This repository contains
@@ -34,12 +42,14 @@ only the customer deployment overlay and reviewed extension packages.
    owners, slugs, URLs, app names, reviewers, and approved connector toolkits.
 2. Replace every `replace-me`, `admin@example.com`, `T0000000000`, and
    `ExampleCo` value. The gateway hostname must match in `qm.config.jsonc` and
-   `sandbox/tools/composio/tool.json`.
+   `sandbox/tools/composio/tool.json`. Set `QM_BRAND_MARK_URL` in web UI and
+   admin to the customer's own public icon URL.
 3. Install Node 24+, Git, Docker Buildx, Fly CLI, Sprites CLI, and OpenSSL.
 4. Run the local gates:
 
    ```bash
    npm ci
+   npm run env:check
    npm run gateway:install
    npm run starter:audit -- --require-customized
    npm exec qm -- check
@@ -83,12 +93,11 @@ Production acceptance requires evidence for:
 - Unified Inbox read and explicitly confirmed send, if enabled;
 - Slack mention/DM behavior, rollback information, and named owners.
 
-## Case-study economics
+## Costs
 
-The original AitlasQM case compared a Viktor-class shared Slack operator costing
-about **$2,000+/month** with a **rough $200/month target** for the redesigned
-infrastructure plus model usage. Those are illustrative case-study figures, not
-a price promise. Customer spend depends on provider plans, machine sizes,
-storage, connector usage, and models.
+The template is MIT-licensed. Each customer pays for their own hosting, model
+usage, storage, connectors, and maintenance. Estimate costs from that customer's
+planned services and provider prices before deploying; this repository does
+not promise a fixed operating price or savings against another product.
 
 The starter is released under the [MIT License](./LICENSE).
