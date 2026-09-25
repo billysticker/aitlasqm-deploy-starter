@@ -4,7 +4,7 @@ import { spawnSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
 
 const root = resolve(dirname(fileURLToPath(import.meta.url)), "..");
-const revision = "7f2c916360f1797a8ff2a77ce2ce40c5fabab087";
+const revision = "5a5cb51260b13000dda5d890d40c877c88d87555";
 const source = join(root, ".generated", `qm-web-ui-${revision.slice(0, 12)}`);
 const configPath = join(root, "qm.config.jsonc");
 

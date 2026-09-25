@@ -1,0 +1,4059 @@
+diff --git a/deploy/web-ui/Dockerfile b/deploy/web-ui/Dockerfile
+index 322f6c69..a8d2093b 100644
+--- a/deploy/web-ui/Dockerfile
++++ b/deploy/web-ui/Dockerfile
+@@ -5,6 +5,7 @@ ENV WEB_UI_BASE=$WEB_UI_BASE
+ COPY plugins/web-ui/package.json plugins/web-ui/package-lock.json ./
+ RUN npm ci
+ COPY plugins/web-ui/index.html plugins/web-ui/shared.html plugins/web-ui/vite.config.ts plugins/web-ui/tsconfig.json ./
++COPY plugins/web-ui/public ./public
+ COPY plugins/web-ui/src ./src
+ COPY plugins/chassis/src /chassis/src
+ RUN npm run build
+diff --git a/plugins/web-ui/server/aitlas.ts b/plugins/web-ui/server/aitlas.ts
+new file mode 100644
+index 00000000..a5786cea
+--- /dev/null
++++ b/plugins/web-ui/server/aitlas.ts
+@@ -0,0 +1,415 @@
++import type { IncomingMessage, ServerResponse } from "node:http";
++import { randomUUID } from "node:crypto";
++import { CAPABILITY_HEADER, type HttpMethod } from "../../chassis/src/core-client.ts";
++import { json, PayloadTooLargeError, readBody } from "../../chassis/src/http.ts";
++
++interface CoreResult {
++  status: number;
++  text: string;
++}
++
++interface AitlasContext {
++  user: string;
++  displayName: string | null;
++  coreFetch: (method: HttpMethod, path: string, body?: string) => Promise<CoreResult>;
++  coreFetchCap: (method: HttpMethod, path: string, body?: string) => Promise<CoreResult>;
++}
++
++function gatewayBase(): string | null {
++  const raw = process.env.AITLAS_COMPOSIO_GATEWAY_URL?.trim();
++  if (!raw) return null;
++  try {
++    const url = new URL(raw);
++    const localTest = process.env.NODE_ENV === "test" && ["localhost", "127.0.0.1"].includes(url.hostname);
++    if ((url.protocol !== "https:" && !(localTest && url.protocol === "http:")) || url.username || url.password || url.search || url.hash) return null;
++    return url.toString().replace(/\/$/, "");
++  } catch {
++    return null;
++  }
++}
++
++function brainGatewayBase(): string | null {
++  const raw = process.env.AITLAS_BRAIN_GATEWAY_URL?.trim();
++  if (!raw) return null;
++  try {
++    const url = new URL(raw);
++    const localTest = process.env.NODE_ENV === "test" && ["localhost", "127.0.0.1"].includes(url.hostname);
++    if ((url.protocol !== "https:" && !(localTest && url.protocol === "http:")) || url.username || url.password || url.search || url.hash) return null;
++    if (!url.pathname.replace(/\/$/, "").endsWith("/api/qm/brain")) return null;
++    return url.toString().replace(/\/$/, "");
++  } catch {
++    return null;
++  }
++}
++
++async function gatewayFetch(ctx: AitlasContext, method: HttpMethod, action: string, body = ""): Promise<CoreResult> {
++  const base = gatewayBase();
++  if (!base) return { status: 503, text: JSON.stringify({ error: "not_configured" }) };
++  const capability = await ctx.coreFetch("POST", "/v1/session-cap", "");
++  if (capability.status !== 200) return capability;
++  let token = "";
++  try {
++    token = String((JSON.parse(capability.text) as { token?: unknown }).token ?? "");
++  } catch {
++    token = "";
++  }
++  if (!token) return { status: 503, text: JSON.stringify({ error: "not_configured" }) };
++  try {
++    const response = await fetch(`${base}/${action}`, {
++      method,
++      headers: {
++        accept: "application/json",
++        ...(body ? { "content-type": "application/json" } : {}),
++        [CAPABILITY_HEADER]: token,
++      },
++      ...(body ? { body } : {}),
++      redirect: "manual",
++      signal: AbortSignal.timeout(30_000),
++    });
++    const text = await response.text();
++    if (text.length > 2_000_000) return { status: 502, text: JSON.stringify({ error: "bad_response" }) };
++    return { status: response.status, text };
++  } catch {
++    return { status: 503, text: JSON.stringify({ error: "unavailable" }) };
++  }
++}
++
++async function brainGatewayFetch(ctx: AitlasContext, action: string, body: string): Promise<CoreResult> {
++  const base = brainGatewayBase();
++  if (!base) return { status: 503, text: JSON.stringify({ error: "not_configured" }) };
++  const capability = await ctx.coreFetch("POST", "/v1/session-cap", "");
++  if (capability.status !== 200) return capability;
++  let token = "";
++  try { token = String((JSON.parse(capability.text) as { token?: unknown }).token ?? ""); } catch { token = ""; }
++  if (!token) return { status: 503, text: JSON.stringify({ error: "not_configured" }) };
++  try {
++    const response = await fetch(`${base}/${action}`, {
++      method: "POST",
++      headers: { accept: "application/json", "content-type": "application/json", [CAPABILITY_HEADER]: token },
++      body,
++      redirect: "manual",
++      signal: AbortSignal.timeout(30_000),
++    });
++    const text = await response.text();
++    if (text.length > 2_000_000) return { status: 502, text: JSON.stringify({ error: "bad_response" }) };
++    return { status: response.status, text };
++  } catch {
++    return { status: 503, text: JSON.stringify({ error: "unavailable" }) };
++  }
++}
++
++async function adminAllowed(ctx: AitlasContext): Promise<boolean> {
++  const result = await ctx.coreFetchCap("GET", "/v1/admin/whoami");
++  if (result.status !== 200) return false;
++  try {
++    const value = JSON.parse(result.text) as { permissions?: unknown };
++    return Array.isArray(value.permissions) && value.permissions.includes("admin");
++  } catch {
++    return false;
++  }
++}
++
++function relayGateway(res: ServerResponse, result: CoreResult): void {
++  if (result.status >= 200 && result.status < 300) {
++    res.writeHead(result.status, { "content-type": "application/json", "cache-control": "no-store" });
++    res.end(result.text);
++    return;
++  }
++  let code = "";
++  try {
++    code = String((JSON.parse(result.text) as { error?: unknown }).error ?? "");
++  } catch {
++    code = "";
++  }
++  if (code === "admin_setup_required") {
++    json(res, 409, { error: code, message: "This app needs a one-time administrator setup before you can connect it." });
++    return;
++  }
++  if (result.status === 401 || result.status === 403) {
++    json(res, result.status, { error: "not_allowed", message: "Open this page from your personal workspace and try again." });
++    return;
++  }
++  json(res, result.status === 429 ? 429 : 503, {
++    error: "connection_unavailable",
++    message: result.status === 429 ? "Too many requests. Try again in a moment." : "Connections are temporarily unavailable.",
++  });
++}
++
++function relayBrain(res: ServerResponse, result: CoreResult): void {
++  if (result.status >= 200 && result.status < 300) {
++    res.writeHead(200, { "content-type": "application/json", "cache-control": "no-store", "x-content-type-options": "nosniff" });
++    res.end(result.text);
++    return;
++  }
++  json(res, result.status === 401 || result.status === 403 ? result.status : 503, {
++    error: result.status === 401 || result.status === 403 ? "not_allowed" : "brain_map_unavailable",
++    message: result.status === 401 || result.status === 403 ? "Brain Map access is not available for this account." : "The Brain Map is temporarily unavailable.",
++  });
++}
++
++function relayDelivery(res: ServerResponse, result: CoreResult, failure: string, reference?: string): void {
++  if (result.status >= 200 && result.status < 300) {
++    const delivery = parseObject(result.text) ?? {};
++    const recipient = delivery.recipient && typeof delivery.recipient === "object"
++      ? field((delivery.recipient as Record<string, unknown>).displayName, 120)
++      : "";
++    json(res, 200, {
++      ok: true,
++      ...(field(delivery.deliveryId, 160) ? { deliveryId: field(delivery.deliveryId, 160) } : {}),
++      ...(recipient ? { recipient } : {}),
++      ...(reference ? { reference } : {}),
++    });
++    return;
++  }
++  json(res, result.status === 400 || result.status === 404 ? result.status : 502, {
++    error: "delivery_failed",
++    message: failure,
++  });
++}
++
++function parseObject(raw: string): Record<string, unknown> | null {
++  try {
++    const value = JSON.parse(raw);
++    return value && typeof value === "object" && !Array.isArray(value) ? (value as Record<string, unknown>) : null;
++  } catch {
++    return null;
++  }
++}
++
++function field(value: unknown, max: number): string {
++  return typeof value === "string" ? value.replace(/\s+/g, " ").trim().slice(0, max) : "";
++}
++
++async function requestBody(req: IncomingMessage, res: ServerResponse): Promise<Record<string, unknown> | null> {
++  try {
++    const parsed = parseObject(await readBody(req));
++    if (!parsed) json(res, 400, { error: "bad_request", message: "Check the form and try again." });
++    return parsed;
++  } catch (error) {
++    if (error instanceof PayloadTooLargeError) throw error;
++    json(res, 400, { error: "bad_request", message: "Check the form and try again." });
++    return null;
++  }
++}
++
++export async function handleAitlasRoute(
++  req: IncomingMessage,
++  res: ServerResponse,
++  path: string,
++  method: string,
++  ctx: AitlasContext,
++): Promise<boolean> {
++  if (!path.startsWith("/api/aitlas/")) return false;
++
++  if (method === "GET" && path === "/api/aitlas/connections/catalog") {
++    relayGateway(res, await gatewayFetch(ctx, "GET", "catalog"));
++    return true;
++  }
++
++  if (method === "GET" && path === "/api/aitlas/connections") {
++    relayGateway(res, await gatewayFetch(ctx, "GET", "connections"));
++    return true;
++  }
++
++  if (method === "POST" && path === "/api/aitlas/connections/connect") {
++    const body = await requestBody(req, res);
++    if (!body) return true;
++    const toolkit = field(body.toolkit, 64).toLowerCase();
++    if (!/^[a-z0-9][a-z0-9_-]{0,63}$/.test(toolkit)) {
++      json(res, 400, { error: "bad_request", message: "Choose a valid app." });
++      return true;
++    }
++    relayGateway(res, await gatewayFetch(ctx, "POST", "connect", JSON.stringify({ toolkit })));
++    return true;
++  }
++
++  if (method === "POST" && path === "/api/aitlas/connections/sync") {
++    const body = await requestBody(req, res);
++    if (!body) return true;
++    const toolkit = field(body.toolkit, 64).toLowerCase();
++    if (toolkit !== "gmail" && toolkit !== "fathom") {
++      json(res, 400, { error: "bad_request", message: "Automatic sync is not available for this app yet." });
++      return true;
++    }
++    const threadRef = `web:${ctx.user}:connections`;
++    const turn = {
++      surface: "web",
++      actor: { externalId: ctx.user, ...(ctx.displayName ? { displayName: ctx.displayName } : {}) },
++      conversation: { kind: "dm", threadRef },
++      liveActor: true,
++      deliveryTarget: threadRef,
++      text: `Finish my private ${toolkit} setup now. Sync the initial 30-day window, ensure exactly one three-hour incremental sync is scheduled, and keep only compact summaries, dates, action items, and source links. Reply only with the number stored and whether the next sync is scheduled.`,
++    };
++    const result = await ctx.coreFetch("POST", "/v1/turns?async=1", JSON.stringify(turn));
++    if (result.status >= 200 && result.status < 300) json(res, 202, { ok: true });
++    else json(res, 502, { error: "sync_failed", message: "Could not start the sync." });
++    return true;
++  }
++
++  if (method === "POST" && path === "/api/aitlas/connections/request") {
++    const body = await requestBody(req, res);
++    if (!body) return true;
++    const toolkit = field(body.toolkit, 80);
++    const reason = field(body.reason, 500);
++    const reviewer = field(process.env.QM_CONNECTION_REVIEWER ?? process.env.QM_MEMORY_REVIEWER, 120);
++    if (!toolkit || !reviewer) {
++      json(res, reviewer ? 400 : 503, { error: "bad_request", message: reviewer ? "Name the app you need." : "No app reviewer is configured." });
++      return true;
++    }
++    const who = ctx.displayName || ctx.user;
++    const text = [`App connection request from ${who}`, `App: ${toolkit}`, reason ? `Need: ${reason}` : ""].filter(Boolean).join("\n");
++    relayDelivery(
++      res,
++      await ctx.coreFetchCap("POST", "/v1/reach", JSON.stringify({ recipient: reviewer, text })),
++      "Could not send that app request.",
++    );
++    return true;
++  }
++
++  if (method === "POST" && path === "/api/aitlas/brain/graph") {
++    if (!(await adminAllowed(ctx))) {
++      json(res, 403, { error: "not_allowed", message: "Brain Map access is not available for this account." });
++      return true;
++    }
++    const body = await requestBody(req, res);
++    if (!body) return true;
++    const query = field(body.query, 240);
++    const connector = field(body.connector, 64).toLowerCase();
++    const entityType = field(body.entityType, 32).toLowerCase();
++    const allowedTypes = new Set(["person", "client", "location", "project", "campaign", "tool-account", "department", "vendor", "artifact"]);
++    const limit = Number.isInteger(body.limit) ? Math.min(100, Math.max(1, Number(body.limit))) : 50;
++    if ((connector && !/^[a-z0-9][a-z0-9_-]{0,63}$/.test(connector)) || (entityType && !allowedTypes.has(entityType))) {
++      json(res, 400, { error: "bad_request", message: "Choose a valid Brain Map filter." });
++      return true;
++    }
++    relayBrain(res, await brainGatewayFetch(ctx, "graph", JSON.stringify({
++      ...(query ? { query } : {}),
++      ...(connector ? { connector } : {}),
++      ...(entityType ? { entityType } : {}),
++      limit,
++    })));
++    return true;
++  }
++
++  if (method === "POST" && path === "/api/aitlas/inbox") {
++    const body = await requestBody(req, res);
++    if (!body) return true;
++    relayGateway(res, await gatewayFetch(ctx, "POST", "inbox", JSON.stringify({
++      ...(Array.isArray(body.sources) ? { sources: body.sources } : {}),
++      ...(typeof body.query === "string" ? { query: body.query } : {}),
++    })));
++    return true;
++  }
++
++  if (method === "POST" && path === "/api/aitlas/inbox/thread") {
++    const body = await requestBody(req, res);
++    if (!body) return true;
++    relayGateway(res, await gatewayFetch(ctx, "POST", "thread", JSON.stringify({
++      source: body.source,
++      threadId: body.threadId,
++      ...(body.channelId ? { channelId: body.channelId } : {}),
++    })));
++    return true;
++  }
++
++  if (method === "POST" && path === "/api/aitlas/inbox/send") {
++    const body = await requestBody(req, res);
++    if (!body) return true;
++    const source = typeof body.source === "string" && ["gmail", "outlook", "slack"].includes(body.source)
++      ? body.source
++      : "";
++    const requestId = field(body.requestId, 128);
++    const text = field(body.text, 8_000);
++    const recipient = field(body.recipient, 500);
++    const channelId = field(body.channelId, 128);
++    const threadId = field(body.threadId, 512);
++    const messageId = field(body.messageId, 512);
++    const hasDestination = source === "slack"
++      ? Boolean(channelId)
++      : source === "outlook"
++        ? Boolean(recipient || messageId)
++        : Boolean(recipient || threadId);
++    if (
++      body.confirmed !== true ||
++      !source ||
++      !/^[A-Za-z0-9_-]{8,128}$/.test(requestId) ||
++      !text ||
++      !hasDestination
++    ) {
++      json(res, 400, { error: "confirmation_required", message: "Review and confirm the exact message before sending." });
++      return true;
++    }
++    relayGateway(res, await gatewayFetch(ctx, "POST", "send", JSON.stringify({
++      source,
++      requestId,
++      confirmed: true,
++      text,
++      ...(channelId ? { channelId } : {}),
++      ...(recipient ? { recipient } : {}),
++      ...(field(body.subject, 300) ? { subject: field(body.subject, 300) } : {}),
++      ...(threadId ? { threadId } : {}),
++      ...(messageId ? { messageId } : {}),
++    })));
++    return true;
++  }
++
++  if (method === "POST" && path === "/api/aitlas/memory/suggest") {
++    const body = await requestBody(req, res);
++    if (!body) return true;
++    const fact = field(body.fact, 1_000);
++    const reviewer = field(process.env.QM_MEMORY_REVIEWER, 120);
++    if (!fact || !reviewer) {
++      json(res, reviewer ? 400 : 503, { error: "bad_request", message: reviewer ? "Choose a memory to suggest." : "No memory reviewer is configured." });
++      return true;
++    }
++    const who = ctx.displayName || ctx.user;
++    const requestId = `MEM-${randomUUID().slice(0, 8).toUpperCase()}`;
++    const text = [
++      `Company memory suggestion ${requestId}`,
++      `From: ${who}`,
++      `Candidate: ${fact}`,
++      "Review for company relevance, sensitivity, and patient information.",
++      `To approve, reply here: approve ${requestId}`,
++      `To reject, reply here: reject ${requestId}`,
++      "Approval writes only this candidate to company memory; delivery alone changes nothing.",
++    ].join("\n");
++    relayDelivery(
++      res,
++      await ctx.coreFetchCap("POST", "/v1/reach", JSON.stringify({ recipient: reviewer, text })),
++      "Could not send that memory suggestion.",
++      requestId,
++    );
++    return true;
++  }
++
++  if (method === "POST" && path === "/api/aitlas/handoff") {
++    const body = await requestBody(req, res);
++    if (!body) return true;
++    const recipient = field(body.recipient, 120);
++    const note = field(body.note, 1_000);
++    const neededBy = field(body.neededBy, 40);
++    if (!recipient || !note) {
++      json(res, 400, { error: "bad_request", message: "Add a teammate and a handoff note." });
++      return true;
++    }
++    const who = ctx.displayName || ctx.user;
++    const requestId = `HAND-${randomUUID().slice(0, 8).toUpperCase()}`;
++    const text = [
++      `Team handoff ${requestId}`,
++      `From: ${who}`,
++      neededBy ? `Needed by: ${neededBy}` : "",
++      note,
++      `Reply here with "accept ${requestId}" or "complete ${requestId}" so the sender receives a receipt.`,
++    ].filter(Boolean).join("\n");
++    relayDelivery(
++      res,
++      await ctx.coreFetchCap("POST", "/v1/reach", JSON.stringify({ recipient, text })),
++      "Could not send that handoff. Check the teammate name and try again.",
++      requestId,
++    );
++    return true;
++  }
++
++  json(res, 404, { error: "not_found" });
++  return true;
++}
+diff --git a/plugins/web-ui/server/index.ts b/plugins/web-ui/server/index.ts
+index 96ae1359..546ecba7 100644
+--- a/plugins/web-ui/server/index.ts
++++ b/plugins/web-ui/server/index.ts
+@@ -31,6 +31,7 @@ import {
+ import { verifyPortalIdentity, PORTAL_IDENTITY_HEADER } from "../../chassis/src/portal-identity.ts";
+ import { createBrandingCache, injectBranding } from "../../chassis/src/branding.ts";
+ import { parseSuggestedActivities } from "../../chassis/src/suggested-activities.ts";
++import { handleAitlasRoute } from "./aitlas.ts";
+ 
+ import {
+   CORE_API_URL as CORE,
+@@ -1085,6 +1086,17 @@ async function serveFileContent(c: WebCtx, playground = false): Promise<unknown>
+ }
+ 
+ const apiRoutes: readonly WebRoute[] = [
++  {
++    match: (_method, pathname) => pathname.startsWith("/api/aitlas/"),
++    handle: async (c) => {
++      await handleAitlasRoute(c.req, c.res, c.url.pathname, c.req.method ?? "GET", {
++        user: c.user,
++        displayName: resolveIdentity(c.req)?.name ?? null,
++        coreFetch,
++        coreFetchCap,
++      });
++    },
++  },
+   {
+     method: "GET",
+     path: "/api/files/by-name/content",
+diff --git a/plugins/web-ui/src/brain-map-model.ts b/plugins/web-ui/src/brain-map-model.ts
+new file mode 100644
+index 00000000..72e3b481
+--- /dev/null
++++ b/plugins/web-ui/src/brain-map-model.ts
+@@ -0,0 +1,102 @@
++export interface BrainNode { id: string; type: string; authority: string; label: string; connector?: string | null; detail?: string | null; operational?: boolean }
++export interface BrainEdge { id: string; from: string; to: string; type: string; recordId?: string | null; recordIds?: string[]; confidence: number; provenance: string; operational?: boolean }
++export interface BrainLink { recordId: string; entityId: string; type: string; confidence: number; provenance: string }
++export interface BrainRecord { id: string; sourceId: string; connector: string; title: string; sourcePointer?: string | null; occurredAt?: string | null; updatedAt?: string | null }
++export interface BrainGraph { nodes: BrainNode[]; edges: BrainEdge[]; links: BrainLink[]; records: BrainRecord[]; sourceCount: number; topologyStatus?: string }
++export interface Filters { person: string; connector: string; query: string; entityType: string; selectedId: string }
++
++export function recordsFor(graph: BrainGraph, id: string) {
++  const ids = new Set(graph.links.filter(link => link.entityId === id).map(link => link.recordId));
++  for (const edge of graph.edges) if (edge.from === id || edge.to === id) {
++    if (edge.recordId) ids.add(edge.recordId);
++    for (const recordId of edge.recordIds || []) ids.add(recordId);
++  }
++  return graph.records.filter(record => ids.has(record.id));
++}
++
++// Only explicit record-to-entity mappings create evidence connections. Sharing a
++// department or appearing in a meeting title is not a client/tool relationship.
++export function withEvidenceEdges(graph: BrainGraph): BrainGraph {
++  const edges = [...graph.edges];
++  const nodes = new Map(graph.nodes.map(node => [node.id, node]));
++  for (const record of graph.records) {
++    const links = graph.links.filter(link => link.recordId === record.id);
++    const tools = links.filter(link => link.type === 'uses-tool' && nodes.get(link.entityId)?.type === 'tool-account');
++    const subjects = links.filter(link => ['person', 'client', 'project', 'location', 'campaign'].includes(nodes.get(link.entityId)?.type || ''));
++    for (const tool of tools) for (const subject of subjects) edges.push({
++      id: 'mapped-' + record.id + '-' + subject.entityId, from: subject.entityId, to: tool.entityId,
++      type: 'linked-evidence', recordId: record.id, confidence: subject.confidence, provenance: subject.provenance,
++    });
++  }
++  const grouped = new Map<string, BrainEdge>();
++  for (const edge of edges) {
++    const key = JSON.stringify([edge.from, edge.to, edge.type, !!edge.operational]);
++    const previous = grouped.get(key);
++    grouped.set(key, { ...edge, id: previous?.id || edge.id, recordIds: [...new Set([
++      ...(previous?.recordIds || []), ...(edge.recordIds || []), ...(edge.recordId ? [edge.recordId] : []),
++    ])] });
++  }
++  return { ...graph, edges: [...grouped.values()] };
++}
++
++export function neighbors(graph: BrainGraph, id: string) {
++  return graph.edges.flatMap(edge => {
++    const otherId = edge.from === id ? edge.to : edge.to === id ? edge.from : '';
++    const other = graph.nodes.find(node => node.id === otherId);
++    return other ? [{ edge, other }] : [];
++  }).sort((a, b) => a.other.label.localeCompare(b.other.label));
++}
++
++export function neighborhood(graph: BrainGraph, id: string) {
++  const ids = new Set([id]);
++  const adjacent = neighbors(graph, id);
++  for (const { other } of adjacent) ids.add(other.id);
++  if (graph.nodes.find(node => node.id === id)?.type === 'person') {
++    for (const { other } of adjacent.filter(({ other }) => other.type === 'client')) {
++      for (const next of neighbors(graph, other.id)) {
++        if (!['person', 'department', 'client'].includes(next.other.type)) ids.add(next.other.id);
++      }
++    }
++  }
++  return ids;
++}
++
++export function toolMatch(graph: BrainGraph, node: BrainNode, connector: string): boolean {
++  if (!connector) return true;
++  if (node.connector === connector || recordsFor(graph, node.id).some(record => record.connector === connector)) return true;
++  if (['client', 'project', 'location', 'campaign'].includes(node.type)) {
++    return neighbors(graph, node.id).some(({ other }) => other.type === 'tool-account' &&
++      (other.connector === connector || recordsFor(graph, other.id).some(record => record.connector === connector)));
++  }
++  return false;
++}
++
++export function visibleGraph(graph: BrainGraph, filters: Filters) {
++  const personScope = filters.person ? neighborhood(graph, filters.person) : null;
++  const focusScope = filters.selectedId ? neighborhood(graph, filters.selectedId) : null;
++  const scope = graph.nodes.filter(node => (!personScope || personScope.has(node.id)) && (!focusScope || focusScope.has(node.id)));
++  const needle = filters.query.trim().toLowerCase();
++  const matches = scope.filter(node =>
++    (!filters.entityType || node.type === filters.entityType) &&
++    (!needle || (node.label + ' ' + (node.detail || '')).toLowerCase().includes(needle)) &&
++    toolMatch(graph, node, filters.connector));
++  const ids = new Set(matches.map(node => node.id));
++  const filtered = Boolean(needle || filters.entityType || filters.connector);
++  if (filtered) {
++    // Keep context on the paths that actually matched, never expand through a
++    // shared department/tool into unrelated people's clients.
++    for (const node of matches) for (const { other } of neighbors(graph, node.id)) {
++      if (!scope.some(candidate => candidate.id === other.id)) continue;
++      if (other.id === filters.person || other.id === filters.selectedId ||
++          (other.type === 'tool-account' && toolMatch(graph, other, filters.connector))) ids.add(other.id);
++    }
++  }
++  const nodes = scope.filter(node => ids.has(node.id));
++  return { ...graph, nodes, edges: graph.edges.filter(edge => ids.has(edge.from) && ids.has(edge.to)), matches };
++}
++
++export function safeSourceUrl(value?: string | null) {
++  if (!value) return null;
++  try { const url = new URL(value); return ['https:', 'http:'].includes(url.protocol) && !url.username && !url.password ? url.href : null; }
++  catch { return null; }
++}
+diff --git a/plugins/web-ui/src/brain-map.ts b/plugins/web-ui/src/brain-map.ts
+new file mode 100644
+index 00000000..10815e3c
+--- /dev/null
++++ b/plugins/web-ui/src/brain-map.ts
+@@ -0,0 +1,230 @@
++import { html, svg, nothing, render } from "lit";
++import { ExternalLink, Network, RefreshCw, Search, ShieldCheck } from "lucide";
++import { api } from "./core-bridge";
++import { errMessage } from "../../chassis/src/errors";
++import { appState, replacePanePreservingFocus } from "./shell";
++import { icon } from "./ui";
++import { withEvidenceEdges, neighbors, neighborhood, recordsFor, toolMatch, visibleGraph, safeSourceUrl, type BrainGraph, type BrainNode, type BrainEdge } from "./brain-map-model";
++
++const TYPE_ORDER = ["department", "person", "client", "project", "campaign", "tool-account", "location", "artifact"];
++const emptyGraph = (): BrainGraph => ({ nodes: [], edges: [], links: [], records: [], sourceCount: 0 });
++let graph = emptyGraph();
++let query = "", connector = "", entityType = "", person = "", selectedId = "";
++let profileOpen = false, loading = false, notice = "";
++let selectedEdge: BrainEdge | null = null;
++let trail: string[] = [];
++let requestVersion = 0;
++let availableTools: string[] = [];
++
++export function resetBrainMapState(): void {
++  graph = emptyGraph();
++  query = connector = entityType = person = selectedId = notice = "";
++  profileOpen = loading = false;
++  selectedEdge = null; trail = []; availableTools = [];
++  requestVersion++;
++}
++
++function title(value: string) {
++  return value.replaceAll("-", " ").replace(/\b\w/g, character => character.toUpperCase());
++}
++function shortLabel(value: string, max = 27) {
++  return value.length <= max ? value : `${value.slice(0, max - 1)}…`;
++}
++function positions(nodes: BrainNode[]) {
++  const present = new Set(nodes.map(node => node.type));
++  const types = [...TYPE_ORDER.filter(type => present.has(type)), ...[...present].filter(type => !TYPE_ORDER.includes(type)).sort()];
++  const result = new Map<string, { x: number; y: number }>();
++  for (const [column, type] of types.entries()) {
++    nodes.filter(node => node.type === type).sort((a, b) => a.label.localeCompare(b.label))
++      .forEach((node, row) => result.set(node.id, { x: 126 + column * 238, y: 108 + row * 82 }));
++  }
++  return { result, types, width: Math.max(760, types.length * 238 + 36),
++    height: Math.max(420, ...types.map(type => nodes.filter(node => node.type === type).length * 82 + 110)) };
++}
++function selectNode(id: string, remember = true): void {
++  if (remember && selectedId && selectedId !== id) trail.push(selectedId);
++  selectedId = id; selectedEdge = null; query = ""; entityType = "";
++  if (person && !neighborhood(graph, person).has(id)) person = "";
++  if (graph.nodes.find(node => node.id === id)?.type === "person") person = id;
++  draw();
++  appState.mainEl?.querySelector<HTMLElement>(".brain-detail-head h2")?.focus();
++}
++function clearFilters(): void {
++  query = connector = entityType = person = selectedId = "";
++  selectedEdge = null; profileOpen = false; trail = [];
++  void load();
++}
++function evidenceCards(records: ReturnType<typeof recordsFor>) {
++  return records.length ? records.map(record => {
++    const url = safeSourceUrl(record.sourcePointer);
++    return html`<article class="brain-record">
++      <div><span>${title(record.connector)}</span>${record.occurredAt ? html`<time>${new Date(record.occurredAt).toLocaleDateString()}</time>` : nothing}</div>
++      <strong>${record.title}</strong>
++      ${url ? html`<a href=${url} target="_blank" rel="noopener noreferrer">Open source ${icon(ExternalLink, 12)}</a>` : html`<span class="brain-detail-muted">Source link unavailable</span>`}
++    </article>`;
++  }) : html`<p class="brain-detail-muted">No linked evidence in the loaded authorized records. This does not mean there are no meetings or records elsewhere.</p>`;
++}
++function selectedDetails() {
++  if (selectedEdge) {
++    const from = graph.nodes.find(node => node.id === selectedEdge!.from)!;
++    const to = graph.nodes.find(node => node.id === selectedEdge!.to)!;
++    const records = graph.records.filter(record => selectedEdge!.recordIds?.includes(record.id));
++    return html`<div class="brain-detail-head"><span class="brain-node-type">Relationship</span>
++      <h2 tabindex="-1">${title(selectedEdge.type)}</h2>
++      <p>${selectedEdge.operational ? "Confirmed by operational records" : "Linked by authorized evidence"}</p></div>
++      <section class="brain-detail-section brain-neighbor-list">
++        <button @click=${() => selectNode(from.id)}>Open ${from.label} profile</button>
++        <button @click=${() => selectNode(to.id)}>Open ${to.label} profile</button>
++      </section>
++      <section class="brain-detail-section"><h3>Evidence <span>${records.length}</span></h3>${evidenceCards(records)}</section>`;
++  }
++  const node = graph.nodes.find(item => item.id === selectedId);
++  if (!node) return html`<div class="brain-map-empty"><strong>Explore a person or client</strong><span>Select a card to focus its connections and open its profile. Use the teammate and tool filters together.</span></div>`;
++  const records = recordsFor(graph, node.id);
++  const connections = neighbors(graph, node.id).filter(({ other }) => !connector || toolMatch(graph, other, connector));
++  const groups = [...new Set(connections.map(({ other }) => other.type))];
++  const scope = neighborhood(graph, node.id);
++  const linkedTools = graph.nodes.filter(item => item.type === "tool-account" && scope.has(item.id) && toolMatch(graph, item, connector));
++  return html`
++    <div class="brain-detail-head">
++      <div class="brain-detail-kicker"><span class="brain-node-type">${title(node.type)} profile</span>${node.connector ? html`<span>${title(node.connector)}</span>` : nothing}</div>
++      <h2 tabindex="-1">${node.label}</h2><p>${node.detail || (node.operational ? "Operational record" : "Knowledge record")}</p>
++      <div class="brain-profile-actions">
++        <button class="btn" @click=${() => { profileOpen = !profileOpen; draw(); }}>${profileOpen ? "Back to map" : "Expand profile"}</button>
++        ${trail.length ? html`<button class="btn" @click=${() => selectNode(trail.pop()!, false)}>Previous profile</button>` : nothing}
++      </div>
++    </div>
++    <section class="brain-detail-section"><h3>Overview</h3>
++      ${connector ? html`<p class="brain-detail-muted">Connections and evidence filtered by ${title(connector)}.</p>` : nothing}
++      <dl class="brain-profile-summary"><dt>Connections</dt><dd>${connections.length}</dd><dt>Linked evidence</dt><dd>${records.length}</dd><dt>Source</dt><dd>${node.operational ? "AI-OS" : "Company Brain"}</dd></dl>
++      <p class="brain-detail-muted">Available authorized information. Personal meeting archives and unmapped records are not included automatically.</p>
++    </section>
++    ${groups.map(type => html`<section class="brain-detail-section">
++      <h3>${title(type)} connections <span>${connections.filter(({ other }) => other.type === type).length}</span></h3>
++      <div class="brain-neighbor-list">${connections.filter(({ other }) => other.type === type).map(({ edge, other }) => html`
++        <button type="button" @click=${() => selectNode(other.id)}><span>${other.label}</span><small>${title(edge.type)} · Open profile →</small></button>
++      `)}</div>
++    </section>`)}
++    ${node.type === "person" && linkedTools.length ? html`<section class="brain-detail-section"><h3>Tools linked through clients</h3>
++      <div class="brain-neighbor-list">${linkedTools.map(tool => html`<button @click=${() => selectNode(tool.id)}><span>${tool.label}</span><small>Open profile →</small></button>`)}</div></section>` : nothing}
++    <section class="brain-detail-section"><h3>Evidence <span>${records.length}</span></h3><div class="brain-record-list">${evidenceCards(records)}</div></section>
++  `;
++}
++function inspectEdge(edge: BrainEdge): void {
++  selectedEdge = edge; draw();
++  appState.mainEl?.querySelector<HTMLElement>(".brain-detail-head h2")?.focus();
++}
++function graphCanvas(view: BrainGraph) {
++  if (!view.nodes.length) return html`<div class="brain-map-empty"><strong>No matching relationships</strong><span>No mapped connection matches these filters in the loaded authorized records. Try All tools or clear the focus. Missing links are not proof that a client does not use a tool.</span></div>`;
++  const layout = positions(view.nodes);
++  return html`<div class="brain-canvas-scroll">
++    <svg class="brain-canvas" viewBox=${`0 0 ${layout.width} ${layout.height}`} width=${layout.width} height=${layout.height} role="group" aria-label="Authorized ExampleCo operational and knowledge relationships">
++      <g class="brain-lanes">${layout.types.map((type, column) => svg`
++        <line x1=${20 + column * 238} y1="52" x2=${20 + column * 238} y2=${layout.height}></line>
++        <text x=${44 + column * 238} y="33">${title(type)}</text>
++        <text class="brain-lane-count" x=${44 + column * 238} y="48">${view.nodes.filter(node => node.type === type).length}</text>
++      `)}</g>
++      <g class="brain-edges">${view.edges.map(edge => {
++        const from = layout.result.get(edge.from), to = layout.result.get(edge.to);
++        if (!from || !to) return nothing;
++        const midpoint = (from.x + to.x) / 2;
++        const path = `M ${from.x} ${from.y} C ${midpoint} ${from.y}, ${midpoint} ${to.y}, ${to.x} ${to.y}`;
++        const label = title(edge.type) + ": " + view.nodes.find(node => node.id === edge.from)?.label + " to " + view.nodes.find(node => node.id === edge.to)?.label;
++        return svg`<g class="brain-edge" role="button" tabindex="0" aria-label=${label} @click=${() => inspectEdge(edge)} @keydown=${(event: KeyboardEvent) => { if (event.key === "Enter" || event.key === " ") { event.preventDefault(); inspectEdge(edge); } }}>
++          <path class="brain-edge-hit" d=${path}></path>
++          <path class=${edge.operational ? "operational" : "evidence"} d=${path}><title>${label}</title></path>
++        </g>`;
++      })}</g>
++      ${view.nodes.map(node => {
++        const point = layout.result.get(node.id)!;
++        const evidence = recordsFor(graph, node.id).length;
++        return svg`<g class=${`brain-node brain-node-${node.type} ${selectedId === node.id ? "selected" : ""}`} transform=${`translate(${point.x - 92} ${point.y - 28})`} role="button" tabindex="0" aria-label=${`${node.label}, ${title(node.type)}, ${evidence} evidence links`} @click=${() => selectNode(node.id)} @keydown=${(event: KeyboardEvent) => { if (event.key === "Enter" || event.key === " ") { event.preventDefault(); selectNode(node.id); } }}>
++          <rect width="184" height="56" rx="10"></rect><circle cx="14" cy="16" r="4"></circle>
++          <text class="brain-node-label" x="24" y="20"><title>${node.label}</title>${shortLabel(node.label)}</text>
++          <text class="brain-node-meta" x="12" y="41">${node.connector ? title(node.connector) : title(node.type)}${evidence ? ` · ${evidence} evidence` : ""}</text>
++        </g>`;
++      })}
++    </svg>
++  </div>`;
++}
++function draw(): void {
++  if (!appState.mainEl || appState.currentView !== "brain") return;
++  const host = document.createElement("div"); host.className = "brain-map-pane";
++  const view = visibleGraph(graph, { person, connector, query, entityType, selectedId });
++  const people = graph.nodes.filter(node => node.type === "person").sort((a, b) => a.label.localeCompare(b.label));
++  const types = [...new Set(view.nodes.map(node => node.type))].sort();
++  const newest = graph.records.map(record => Date.parse(record.occurredAt || record.updatedAt || "")).filter(Number.isFinite).sort((a, b) => b - a)[0];
++  render(html`
++    <header class="brain-map-head"><div><span class="eyebrow">Company knowledge</span><h1>Brain map</h1><p>Explore a teammate's clients, connected tools and evidence. Select a card to focus its relationships and open its profile.</p></div>
++      <div class="brain-map-trust">${icon(ShieldCheck, 16)} Permission-filtered before display</div>
++    </header>
++    <form class="brain-map-filters" @submit=${(event: SubmitEvent) => { event.preventDefault(); draw(); }}>
++      <label class="brain-search">${icon(Search, 15)}<input aria-label="Filter Brain Map" placeholder="Search within these connections" .value=${query} @input=${(event: Event) => { query = (event.target as HTMLInputElement).value; }} /></label>
++      <select aria-label="Teammate filter" .value=${person} @change=${(event: Event) => { person = (event.target as HTMLSelectElement).value; selectedId = ""; query = ""; entityType = ""; trail = []; selectedEdge = null; if (person) selectNode(person); else draw(); }}>
++        <option value="" ?selected=${!person}>All teammates</option>${people.map(node => html`<option value=${node.id} ?selected=${person === node.id}>${node.label}</option>`)}
++      </select>
++      <select aria-label="Tool or evidence filter" .value=${connector} @change=${(event: Event) => { connector = (event.target as HTMLSelectElement).value; selectedEdge = null; void load(); }}>
++        <option value="" ?selected=${!connector}>All tools and evidence</option>${[...new Set([...availableTools, connector].filter(Boolean))].map(tool => html`<option value=${tool} ?selected=${connector === tool}>${title(tool)}</option>`)}
++      </select>
++      <select aria-label="Entity type" .value=${entityType} @change=${(event: Event) => { entityType = (event.target as HTMLSelectElement).value; draw(); }}><option value="" ?selected=${!entityType}>All types</option>${TYPE_ORDER.map(type => html`<option value=${type} ?selected=${entityType === type}>${title(type)}</option>`)}</select>
++      <button class="btn primary" type="submit" ?disabled=${loading}>Apply</button>
++      <button class="btn" type="button" @click=${clearFilters}>Reset</button>
++      <button class="icon-btn" type="button" title="Refresh Brain Map" aria-label="Refresh Brain Map" ?disabled=${loading} @click=${() => void load()}>${icon(RefreshCw, 16)}</button>
++    </form>
++    ${notice ? html`<div class="brain-map-notice" role="status">${notice}</div>` : nothing}
++    <section class="brain-map-stats" aria-label="Brain Map summary">
++      <div><strong>${view.nodes.filter(node => node.type === "client").length}</strong><span>clients in view</span></div>
++      <div><strong>${view.nodes.filter(node => node.type === "person").length}</strong><span>people in view</span></div>
++      <div><strong>${view.nodes.filter(node => node.type === "tool-account").length}</strong><span>tools in view</span></div>
++      <div><strong>${graph.records.length}</strong><span>loaded evidence records</span></div>
++      <div><strong>${graph.sourceCount}</strong><span>authorized sources</span></div>
++    </section>
++    <section class="brain-map-pulse" aria-label="Brain Map freshness">
++      <div><span class=${graph.topologyStatus === "current" ? "brain-live-dot" : "brain-muted-dot"}></span><strong>${graph.topologyStatus === "current" ? "Operational structure is current" : "Showing available evidence"}</strong></div>
++      <span>${loading ? "Refreshing…" : newest ? "Newest loaded evidence " + new Date(newest).toLocaleDateString() : "No connector evidence loaded"}</span>
++    </section>
++    <div class="brain-focus-bar" aria-live="polite">
++      <strong>${selectedId ? graph.nodes.find(node => node.id === selectedId)?.label || "Selection unavailable" : "All authorized relationships"}</strong>
++      <span>${view.nodes.length} of ${graph.nodes.length} entities · ${view.edges.length} connections shown</span>
++      ${selectedId ? html`<button class="btn" @click=${() => { selectedId = ""; selectedEdge = null; profileOpen = false; draw(); }}>Clear focus</button>` : nothing}
++      ${person && connector ? html`<span>${view.matches.filter(node => node.type === "client").length} matching clients for ${title(connector)}</span>` : nothing}
++    </div>
++    <p class="brain-coverage">AI-OS provides people, clients and assignments. Company Brain supplies linked evidence. Showing up to 100 recent authorized evidence records${connector ? " for " + title(connector) : ""}; unmapped or private meetings will not appear under a client.</p>
++    <div class="brain-map-legend" aria-label="Visible relationship types">${types.map(type => html`<span class=${`brain-legend-${type}`}><i></i>${title(type)} <b>${view.nodes.filter(node => node.type === type).length}</b></span>`)}</div>
++    <section class=${profileOpen ? "brain-map-workbench brain-profile-expanded" : "brain-map-workbench"}>
++      <div class="brain-graph-panel"><div class="brain-graph-title">${icon(Network, 16)} ${selectedId ? "Focused connections" : "Relationship explorer"} <span>Select a card or line to explore</span></div>${graphCanvas(view)}</div>
++      <aside class="brain-detail-panel" aria-label="Entity profile">${selectedDetails()}</aside>
++    </section>
++  `, host);
++  replacePanePreservingFocus(host);
++}
++async function load(): Promise<void> {
++  const version = ++requestVersion, tool = connector;
++  loading = true; notice = ""; draw();
++  try {
++    const request = (connector = "") => api<BrainGraph>("/api/aitlas/brain/graph", { method: "POST", body: JSON.stringify({ connector, limit: 100 }) });
++    const [base, evidence] = await Promise.all([request(), tool ? request(tool) : Promise.resolve(null)]);
++    if (version !== requestVersion || appState.currentView !== "brain") return;
++    availableTools = [...new Set([...base.nodes.map(node => node.connector), ...base.records.map(record => record.connector), tool].filter(Boolean))].sort() as string[];
++    const combined = evidence ? {
++      ...evidence, sourceCount: base.sourceCount, topologyStatus: base.topologyStatus,
++      nodes: [...[...base.nodes.filter(node => node.operational), ...evidence.nodes].reduce((nodes, node) => nodes.set(node.id, { ...nodes.get(node.id), ...node }), new Map<string, BrainNode>()).values()],
++      edges: [...base.edges.filter(edge => edge.operational), ...evidence.edges.filter(edge => !edge.operational)],
++    } : base;
++    graph = withEvidenceEdges(combined);
++    if (person && !graph.nodes.some(node => node.id === person)) person = "";
++    if (selectedId && !graph.nodes.some(node => node.id === selectedId)) {
++      selectedId = ""; profileOpen = false; notice = "That profile is no longer available in your authorized view.";
++    }
++    selectedEdge = null;
++  } catch (error) {
++    if (version !== requestVersion) return;
++    notice = errMessage(error, "The Brain Map could not be loaded.");
++    graph = emptyGraph(); selectedEdge = null;
++  } finally {
++    if (version === requestVersion) { loading = false; draw(); }
++  }
++}
++export async function renderBrainMap(): Promise<void> {
++  draw(); await load();
++}
+diff --git a/plugins/web-ui/src/memory.ts b/plugins/web-ui/src/memory.ts
+index 72b48b61..06e14a23 100644
+--- a/plugins/web-ui/src/memory.ts
++++ b/plugins/web-ui/src/memory.ts
+@@ -1,5 +1,5 @@
+ import { html, nothing, render } from "lit";
+-import { Clock3, Pencil, Search, Trash2 } from "lucide";
++import { Building2, Clock3, Pencil, Search, Send, Trash2, UserRoundCheck } from "lucide";
+ import { api, ApiError } from "./core-bridge";
+ import { errMessage } from "../../chassis/src/errors";
+ import { icon } from "./ui";
+@@ -26,6 +26,9 @@ let search = "";
+ let historyOpen = false;
+ let history: RevisionRow[] = [];
+ let memoryConfirmation: { title: string; body: string; action: string; run: () => Promise<void> } | null = null;
++let memoryShareDialog:
++  | { kind: "suggest" | "handoff"; fact: string; recipient: string; note: string; neededBy: string; pending: boolean }
++  | null = null;
+ 
+ export function resetMemoryState(): void {
+   memoryDraft = "";
+@@ -39,6 +42,7 @@ export function resetMemoryState(): void {
+   historyOpen = false;
+   history = [];
+   memoryConfirmation = null;
++  memoryShareDialog = null;
+ }
+ 
+ function facts(content: string): Array<{ line: number; text: string; date?: string }> {
+@@ -106,6 +110,14 @@ function drawMemory(loading = false): void {
+       </div>
+       ${memoryNotice || loading ? html`<div class="status">${memoryNotice || "Loading…"}</div>` : nothing}
+       <div class="memory-editor">
++        <div class="memory-privacy-note">
++          ${icon(Building2, 17)}
++          <div><strong>Private stays private.</strong><span>Suggest only the work facts your team should know. A reviewer decides what reaches company memory.</span></div>
++        </div>
++        <p class="memory-help">
++          Edit the notebook directly. Switch to Facts view to search or remove individual facts. Saves are protected if
++          the agent remembers something new while this page is open.
++        </p>
+         ${
+           rawEditing
+             ? html`<textarea
+@@ -129,15 +141,23 @@ function drawMemory(loading = false): void {
+                               <div>${fact.text}</div>
+                               ${fact.date ? html`<div class="card-meta">Captured ${fact.date}</div>` : nothing}
+                             </div>
+-                            <button
+-                              class="icon-btn"
+-                              type="button"
+-                              aria-label="Forget this fact"
+-                              ${tip("Forget this fact")}
+-                              @click=${() => removeFact(fact.line)}
+-                            >
+-                              ${icon(Trash2, 15)}
+-                            </button>
++                            <div class="memory-fact-actions">
++                              <button class="btn compact" type="button" @click=${() => openMemoryShare("suggest", fact.text)}>
++                                ${icon(Building2, 14)} Suggest to company
++                              </button>
++                              <button class="btn compact" type="button" @click=${() => openMemoryShare("handoff", fact.text)}>
++                                ${icon(UserRoundCheck, 14)} Handoff
++                              </button>
++                              <button
++                                class="icon-btn"
++                                type="button"
++                                aria-label="Forget this fact"
++                                ${tip("Forget this fact")}
++                                @click=${() => removeFact(fact.line)}
++                              >
++                                ${icon(Trash2, 15)}
++                              </button>
++                            </div>
+                           </div>`,
+                       )
+                     : html`<div class="empty-state">
+@@ -205,6 +225,7 @@ function drawMemory(loading = false): void {
+               </section>`
+             : nothing
+         }
++        ${memoryShareDialog ? memoryShareDialogView() : nothing}
+       </div>
+     `,
+     host,
+@@ -212,6 +233,81 @@ function drawMemory(loading = false): void {
+   replacePanePreservingFocus(host);
+ }
+ 
++function openMemoryShare(kind: "suggest" | "handoff", fact: string): void {
++  memoryShareDialog = { kind, fact, recipient: "", note: fact, neededBy: "", pending: false };
++  drawMemory();
++}
++
++function closeMemoryShare(): void {
++  if (memoryShareDialog?.pending) return;
++  memoryShareDialog = null;
++  drawMemory();
++}
++
++function memoryShareDialogView() {
++  const draft = memoryShareDialog!;
++  const suggestion = draft.kind === "suggest";
++  return html`<div class="memory-share-scrim" @click=${(event: MouseEvent) => event.target === event.currentTarget && closeMemoryShare()}>
++    <form
++      class="memory-share-dialog"
++      role="dialog"
++      aria-modal="true"
++      aria-labelledby="memory-share-title"
++      @submit=${(event: Event) => {
++        event.preventDefault();
++        void submitMemoryShare();
++      }}
++    >
++      <div class="own-connections-eyebrow">${suggestion ? "Company memory suggestion" : "Team handoff"}</div>
++      <h2 id="memory-share-title">${suggestion ? "Suggest this to the company" : "Hand this work to a teammate"}</h2>
++      <p>${suggestion ? "This sends a suggestion for review. It does not automatically copy your private memory." : "The teammate receives a private handoff with only the note below."}</p>
++      ${suggestion
++        ? html`<div class="memory-share-preview">${draft.fact}</div>`
++        : html`
++            <label>Teammate<input required maxlength="120" placeholder="Name or work email" .value=${draft.recipient} @input=${(event: Event) => {
++              draft.recipient = (event.target as HTMLInputElement).value;
++            }} /></label>
++            <label>Needed by<input type="date" .value=${draft.neededBy} @input=${(event: Event) => {
++              draft.neededBy = (event.target as HTMLInputElement).value;
++            }} /></label>
++            <label>Handoff note<textarea required maxlength="1000" .value=${draft.note} @input=${(event: Event) => {
++              draft.note = (event.target as HTMLTextAreaElement).value;
++            }}></textarea></label>
++          `}
++      <div class="actions">
++        <button class="btn" type="button" ?disabled=${draft.pending} @click=${closeMemoryShare}>Cancel</button>
++        <button class="btn primary" type="submit" ?disabled=${draft.pending}>
++          ${icon(Send, 14)} ${draft.pending ? "Sending…" : suggestion ? "Send suggestion" : "Send handoff"}
++        </button>
++      </div>
++    </form>
++  </div>`;
++}
++
++async function submitMemoryShare(): Promise<void> {
++  const draft = memoryShareDialog;
++  if (!draft || draft.pending) return;
++  draft.pending = true;
++  drawMemory();
++  try {
++    if (draft.kind === "suggest") {
++      const result = await api<{ recipient?: string; reference?: string }>("/api/aitlas/memory/suggest", { method: "POST", body: JSON.stringify({ fact: draft.fact }) });
++      memoryNotice = `${result.reference ? `${result.reference} · ` : ""}Sent to ${result.recipient || "the company reviewer"}. Your private memory is unchanged until approved.`;
++    } else {
++      const result = await api<{ recipient?: string; reference?: string }>("/api/aitlas/handoff", {
++        method: "POST",
++        body: JSON.stringify({ recipient: draft.recipient, note: draft.note, neededBy: draft.neededBy }),
++      });
++      memoryNotice = `${result.reference ? `${result.reference} · ` : ""}Private handoff delivered to ${result.recipient || draft.recipient}.`;
++    }
++    memoryShareDialog = null;
++  } catch (error) {
++    memoryNotice = errMessage(error, draft.kind === "suggest" ? "Could not send that suggestion." : "Could not send that handoff.");
++    draft.pending = false;
++  }
++  drawMemory();
++}
++
+ export async function renderMemory(force = false): Promise<void> {
+   if (appState.currentView !== "memory") return;
+   const dirty = memoryLoaded && memoryDraft !== memorySaved;
+diff --git a/plugins/web-ui/src/personal-connections.ts b/plugins/web-ui/src/personal-connections.ts
+new file mode 100644
+index 00000000..3d3f4335
+--- /dev/null
++++ b/plugins/web-ui/src/personal-connections.ts
+@@ -0,0 +1,347 @@
++import { html, nothing, render } from "lit";
++import { Check, ExternalLink, LockKeyhole, Plug, Plus, RefreshCw, Search, Send } from "lucide";
++import { api } from "./core-bridge";
++import { errMessage } from "../../chassis/src/errors";
++import { appState, replacePanePreservingFocus } from "./shell";
++import { icon } from "./ui";
++
++interface Toolkit {
++  slug: string;
++  name: string;
++  logo: string | null;
++  description: string;
++  connectable: boolean;
++  setupRequired: boolean;
++}
++
++interface Connection {
++  toolkit: string;
++  status: string;
++  active: boolean;
++}
++
++let toolkits: Toolkit[] = [];
++let connections: Connection[] = [];
++let query = "";
++let filter: "all" | "connected" = "all";
++let loading = false;
++let notice = "";
++let activeAction = "";
++let visibleCount = 36;
++let requestOpen = false;
++let requestedToolkit = "";
++let requestReason = "";
++let focusBound = false;
++
++export function resetPersonalConnectionsState(): void {
++  toolkits = [];
++  connections = [];
++  query = "";
++  filter = "all";
++  loading = false;
++  notice = "";
++  activeAction = "";
++  visibleCount = 36;
++  requestOpen = false;
++  requestedToolkit = "";
++  requestReason = "";
++}
++
++function countFor(slug: string): number {
++  return connections.filter((connection) => connection.active && connection.toolkit.toLowerCase() === slug).length;
++}
++
++function initials(name: string): string {
++  return name
++    .split(/\s+/)
++    .slice(0, 2)
++    .map((part) => part[0] ?? "")
++    .join("")
++    .toUpperCase();
++}
++
++function appLogo(toolkit: Toolkit) {
++  return toolkit.logo
++    ? html`<img class="own-connection-logo" src=${toolkit.logo} alt="" loading="lazy" />`
++    : html`<span class="own-connection-logo fallback" aria-hidden="true">${initials(toolkit.name)}</span>`;
++}
++
++function draw(): void {
++  if (appState.currentView !== "connections" || !appState.mainEl) return;
++  const needle = query.trim().toLowerCase();
++  const matched = toolkits.filter((toolkit) => {
++    if (filter === "connected" && countFor(toolkit.slug) === 0) return false;
++    return !needle || `${toolkit.name} ${toolkit.slug} ${toolkit.description}`.toLowerCase().includes(needle);
++  });
++  const visible = matched.slice(0, visibleCount);
++  const host = document.createElement("div");
++  host.className = "pane own-connections-pane";
++  render(
++    html`
++      <div class="own-connections-hero">
++        <div class="own-connections-hero-mark">${icon(LockKeyhole, 20)}</div>
++        <div>
++          <div class="own-connections-eyebrow">Your private workspace</div>
++          <h1>Add your own connections</h1>
++          <p>Connect the work accounts you want AitlasQM to use for you. Teammates cannot see or use them.</p>
++        </div>
++      </div>
++      <div class="own-connections-toolbar">
++        <div class="own-connections-tabs" role="tablist" aria-label="Connection filter">
++          <button
++            type="button"
++            role="tab"
++            aria-selected=${filter === "all" ? "true" : "false"}
++            class=${filter === "all" ? "active" : ""}
++            @click=${() => {
++              filter = "all";
++              visibleCount = 36;
++              draw();
++            }}
++          >All</button>
++          <button
++            type="button"
++            role="tab"
++            aria-selected=${filter === "connected" ? "true" : "false"}
++            class=${filter === "connected" ? "active" : ""}
++            @click=${() => {
++              filter = "connected";
++              visibleCount = 36;
++              draw();
++            }}
++          >Connected</button>
++        </div>
++        <label class="own-connections-search">
++          ${icon(Search, 17)}
++          <span class="sr-only">Search apps</span>
++          <input
++            type="search"
++            placeholder="Search apps"
++            .value=${query}
++            @input=${(event: Event) => {
++              query = (event.target as HTMLInputElement).value;
++              visibleCount = 36;
++              draw();
++            }}
++          />
++        </label>
++        <button
++          class="btn own-connections-request"
++          type="button"
++          @click=${() => {
++            requestedToolkit = query.trim();
++            requestOpen = true;
++            draw();
++          }}
++        >${icon(Plus, 16)} Request an app</button>
++      </div>
++      ${notice ? html`<div class="status own-connections-notice" role="status">${notice}</div>` : nothing}
++      ${
++        loading
++          ? html`<div class="empty-state">Loading your apps…</div>`
++          : visible.length
++            ? html`<div class="own-connections-grid">
++                ${visible.map((toolkit) => {
++                  const connected = countFor(toolkit.slug);
++                  const busy = activeAction === toolkit.slug;
++                  const syncable = connected > 0 && (toolkit.slug === "gmail" || toolkit.slug === "fathom");
++                  return html`<article class="own-connection-card ${connected ? "connected" : ""}">
++                    <div class="own-connection-main">
++                      ${appLogo(toolkit)}
++                      <div class="own-connection-copy">
++                        <div class="own-connection-title-row">
++                          <h2>${toolkit.name}</h2>
++                          ${connected ? html`<span class="own-connection-shield" title="Connected">${icon(Check, 13)}</span>` : nothing}
++                        </div>
++                        <p>${toolkit.description || `Connect your ${toolkit.name} account.`}</p>
++                      </div>
++                    </div>
++                    <div class="own-connection-foot">
++                      <span class=${connected ? "own-connection-count active" : "own-connection-count"}>
++                        ${connected ? `${connected} active` : toolkit.setupRequired ? "Admin setup needed" : "Not connected"}
++                      </span>
++                      ${
++                        syncable
++                          ? html`<button class="btn" type="button" ?disabled=${busy} @click=${() => void syncNow(toolkit)}>
++                              ${icon(RefreshCw, 15)} ${busy ? "Starting…" : "Sync now"}
++                            </button>`
++                          : connected
++                            ? html`<button class="btn" type="button" disabled>${icon(Check, 15)} Connected</button>`
++                            : toolkit.connectable
++                              ? html`<button class="btn primary" type="button" ?disabled=${busy} @click=${() => void connect(toolkit)}>
++                                  ${icon(ExternalLink, 15)} ${busy ? "Opening…" : "Connect"}
++                                </button>`
++                              : html`<button class="btn" type="button" @click=${() => openRequest(toolkit)}>
++                                  ${icon(Send, 15)} Request setup
++                                </button>`
++                      }
++                    </div>
++                  </article>`;
++                })}
++              </div>
++              ${visible.length < matched.length
++                ? html`<div class="own-connections-more"><button class="btn" type="button" @click=${() => {
++                    visibleCount += 36;
++                    draw();
++                  }}>Show more</button></div>`
++                : nothing}`
++            : html`<div class="empty-state">${filter === "connected" ? "You have not connected any apps yet." : "No apps match this search."}</div>`
++      }
++      ${requestOpen ? requestDialog() : nothing}
++    `,
++    host,
++  );
++  replacePanePreservingFocus(host);
++}
++
++function requestDialog() {
++  return html`<div class="own-connections-dialog-scrim" @click=${(event: MouseEvent) => event.target === event.currentTarget && closeRequest()}>
++    <form class="own-connections-dialog" @submit=${(event: Event) => {
++      event.preventDefault();
++      void requestApp();
++    }}>
++      <div class="own-connections-eyebrow">App request</div>
++      <h2>Request an app</h2>
++      <p>An administrator will review apps that need a one-time setup.</p>
++      <label>App name<input required maxlength="80" .value=${requestedToolkit} @input=${(event: Event) => {
++        requestedToolkit = (event.target as HTMLInputElement).value;
++      }} /></label>
++      <label>What do you need it for?<textarea maxlength="500" .value=${requestReason} @input=${(event: Event) => {
++        requestReason = (event.target as HTMLTextAreaElement).value;
++      }}></textarea></label>
++      <div class="actions">
++        <button class="btn" type="button" @click=${closeRequest}>Cancel</button>
++        <button class="btn primary" type="submit" ?disabled=${activeAction === "request"}>${activeAction === "request" ? "Sending…" : "Send request"}</button>
++      </div>
++    </form>
++  </div>`;
++}
++
++function closeRequest(): void {
++  requestOpen = false;
++  requestReason = "";
++  draw();
++}
++
++function openRequest(toolkit: Toolkit): void {
++  requestedToolkit = toolkit.name;
++  requestOpen = true;
++  draw();
++}
++
++async function requestApp(): Promise<void> {
++  if (!requestedToolkit.trim() || activeAction) return;
++  activeAction = "request";
++  draw();
++  try {
++    await api("/api/aitlas/connections/request", {
++      method: "POST",
++      body: JSON.stringify({ toolkit: requestedToolkit.trim(), reason: requestReason.trim() }),
++    });
++    requestOpen = false;
++    requestedToolkit = "";
++    requestReason = "";
++    notice = "Request sent to the administrator.";
++  } catch (error) {
++    notice = errMessage(error, "Could not send that request.");
++  } finally {
++    activeAction = "";
++    draw();
++  }
++}
++
++async function connect(toolkit: Toolkit): Promise<void> {
++  if (activeAction) return;
++  activeAction = toolkit.slug;
++  notice = "";
++  const popup = window.open("about:blank", "_blank");
++  if (popup) popup.opener = null;
++  draw();
++  try {
++    const result = await api<{ connectUrl?: string }>("/api/aitlas/connections/connect", {
++      method: "POST",
++      body: JSON.stringify({ toolkit: toolkit.slug }),
++    });
++    if (!result.connectUrl) throw new Error("No connection link was returned.");
++    if (popup) popup.location.replace(result.connectUrl);
++    else window.location.assign(result.connectUrl);
++    notice = `Finish connecting ${toolkit.name} in the new tab, then return here.`;
++    void pollForConnection(toolkit.slug, 20);
++  } catch (error) {
++    popup?.close();
++    notice = errMessage(error, `Could not connect ${toolkit.name}.`);
++  } finally {
++    activeAction = "";
++    draw();
++  }
++}
++
++async function syncNow(toolkit: Toolkit): Promise<void> {
++  if (activeAction) return;
++  activeAction = toolkit.slug;
++  notice = "";
++  draw();
++  try {
++    await api("/api/aitlas/connections/sync", {
++      method: "POST",
++      body: JSON.stringify({ toolkit: toolkit.slug }),
++    });
++    notice = `${toolkit.name} sync started. Future updates will run automatically.`;
++  } catch (error) {
++    notice = errMessage(error, `Could not start the ${toolkit.name} sync.`);
++  } finally {
++    activeAction = "";
++    draw();
++  }
++}
++
++async function loadConnections(): Promise<void> {
++  const result = await api<{ connections?: Connection[] }>("/api/aitlas/connections");
++  connections = result.connections ?? [];
++}
++
++async function pollForConnection(slug: string, attempts: number): Promise<void> {
++  for (let attempt = 0; attempt < attempts && appState.currentView === "connections"; attempt++) {
++    await new Promise((resolve) => window.setTimeout(resolve, 4_000));
++    try {
++      await loadConnections();
++      draw();
++      if (countFor(slug) > 0) {
++        const toolkit = toolkits.find((item) => item.slug === slug);
++        if (toolkit && (slug === "gmail" || slug === "fathom")) await syncNow(toolkit);
++        else {
++          notice = "Connection ready.";
++          draw();
++        }
++        return;
++      }
++    } catch {
++      return;
++    }
++  }
++}
++
++export async function renderPersonalConnections(): Promise<void> {
++  if (appState.currentView !== "connections") return;
++  if (!focusBound) {
++    focusBound = true;
++    window.addEventListener("focus", () => {
++      if (appState.currentView === "connections") void loadConnections().then(draw).catch(() => {});
++    });
++  }
++  loading = true;
++  notice = "";
++  draw();
++  try {
++    const [catalog] = await Promise.all([
++      api<{ toolkits?: Toolkit[] }>("/api/aitlas/connections/catalog"),
++      loadConnections(),
++    ]);
++    toolkits = catalog.toolkits ?? [];
++  } catch (error) {
++    notice = errMessage(error, "Could not load your apps.");
++  } finally {
++    loading = false;
++    draw();
++  }
++}
+diff --git a/plugins/web-ui/src/shell-state.ts b/plugins/web-ui/src/shell-state.ts
+index 8e2abeda..a579f247 100644
+--- a/plugins/web-ui/src/shell-state.ts
++++ b/plugins/web-ui/src/shell-state.ts
+@@ -23,12 +23,14 @@ export interface Me {
+ const VIEWS = [
+   "chats",
+   "inbox",
++  "brain",
+   "calendar",
+   "contexts",
+   "webhooks",
+   "crons",
+   "loops",
+   "files",
++  "connections",
+   "keychain",
+   "deploys",
+   "memory",
+diff --git a/plugins/web-ui/src/shell.css b/plugins/web-ui/src/shell.css
+index a95da344..26dbb76c 100644
+--- a/plugins/web-ui/src/shell.css
++++ b/plugins/web-ui/src/shell.css
+@@ -214,8 +214,10 @@ body.resizing-sidebar {
+   display: flex;
+   align-items: center;
+   gap: 7.5px;
++  flex: 1;
++  overflow: hidden;
+ }
+-.brand-mark {
++.brand-logo {
+   display: inline-flex;
+   align-items: center;
+   justify-content: center;
+@@ -5487,183 +5489,611 @@ a.connector-widget:focus-visible {
+   font-size: 14px;
+ }
+ 
+-.resource-pane {
+-  flex: 1;
+-  min-height: 0;
+-  overflow-y: auto;
++.sr-only {
++  position: absolute;
++  width: 1px;
++  height: 1px;
++  padding: 0;
++  margin: -1px;
++  overflow: hidden;
++  clip: rect(0, 0, 0, 0);
++  white-space: nowrap;
++  border: 0;
++}
++.own-connections-pane {
++  padding-top: 34px;
++}
++.own-connections-hero,
++.own-connections-toolbar,
++.own-connections-grid,
++.own-connections-notice,
++.own-connections-more {
++  width: 100%;
++  max-width: 1180px;
++  margin-inline: auto;
+   box-sizing: border-box;
+-  padding: 32px 24px;
+ }
+-.resource-detail,
+-.resource-form {
+-  max-width: 640px;
+-  margin: 0 auto;
++.own-connections-hero {
+   display: flex;
+-  flex-direction: column;
++  align-items: flex-start;
+   gap: 16px;
++  padding: 5px 0 26px 18px;
++  border-left: 4px solid var(--brand-accent);
+ }
+-.resource-detail h2,
+-.resource-form h2 {
+-  font-size: 20px;
+-  font-weight: 600;
+-  letter-spacing: 0;
++.own-connections-hero-mark {
++  display: grid;
++  place-items: center;
++  width: 40px;
++  height: 40px;
++  flex: 0 0 40px;
++  border-radius: 12px;
++  background: color-mix(in srgb, var(--brand-accent) 13%, var(--background));
++  color: var(--brand-accent);
++}
++.own-connections-eyebrow {
++  color: var(--brand-accent);
++  font-size: 11px;
++  font-weight: 700;
++  letter-spacing: 0.08em;
++  text-transform: uppercase;
++}
++.own-connections-hero h1 {
++  margin: 2px 0 4px;
++  font-size: 26px;
++  font-weight: 650;
++  letter-spacing: -0.025em;
++}
++.own-connections-hero p {
++  max-width: 680px;
+   margin: 0;
++  color: var(--muted-foreground);
+ }
+-.resource-heading {
+-  display: flex;
+-  align-items: center;
+-  justify-content: space-between;
++.own-connections-toolbar {
++  display: grid;
++  grid-template-columns: auto minmax(220px, 1fr) auto;
+   gap: 12px;
+-}
+-.resource-heading .btn {
+-  display: inline-flex;
+   align-items: center;
+-  gap: 7px;
++  padding: 16px 0;
++  border-top: 1px solid var(--border);
++  border-bottom: 1px solid var(--border);
+ }
+-.copyrow {
+-  display: flex;
++.own-connections-tabs {
++  display: inline-flex;
+   align-items: center;
+-  gap: 8px;
+-}
+-.copyrow .mono {
+-  flex: 1;
+-  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+-  font-size: 12px;
+-  padding: 8px 11px;
++  padding: 3px;
+   border: 1px solid var(--border);
+-  border-radius: var(--radius-sm);
+-  background: var(--secondary);
+-  overflow-x: auto;
+-  white-space: nowrap;
+-}
+-.copyrow .btn {
+-  flex-shrink: 0;
+-}
+-.resource-form label {
+-  display: flex;
+-  flex-direction: column;
+-  gap: 6px;
+-  font-size: 13px;
+-  font-weight: 600;
++  border-radius: var(--radius-md);
++  background: color-mix(in srgb, var(--secondary) 58%, var(--background));
+ }
+-.resource-form .hint {
+-  font-weight: 400;
+-  font-size: 12px;
++.own-connections-tabs button {
++  min-height: 34px;
++  padding: 6px 13px;
++  border: 0;
++  border-radius: 7px;
++  background: transparent;
+   color: var(--muted-foreground);
+-}
+-.resource-form textarea {
+   font: inherit;
+-  font-size: 13px;
+-  padding: 9px 11px;
+-  border: 1px solid var(--border);
+-  border-radius: var(--radius-sm);
++  cursor: pointer;
++}
++.own-connections-tabs button.active {
+   background: var(--background);
+   color: var(--foreground);
+-  width: 100%;
+-  box-sizing: border-box;
+-  resize: vertical;
++  box-shadow: 0 1px 3px color-mix(in srgb, var(--foreground) 10%, transparent);
+ }
+-.resource-form textarea:focus,
+-.signin input:focus {
+-  outline: 2px solid var(--border);
+-  outline-offset: 1px;
++.own-connections-search {
++  display: flex;
++  align-items: center;
++  gap: 9px;
++  min-height: 40px;
++  padding: 0 12px;
++  border: 1px solid var(--border);
++  border-radius: var(--radius-md);
++  color: var(--muted-foreground);
++  background: var(--background);
+ }
+-.resource-form .form-menu-control {
++.own-connections-search input {
+   width: 100%;
++  border: 0;
++  outline: 0;
++  background: transparent;
++  color: var(--foreground);
++  font: inherit;
+ }
+-.resource-form .form-menu-control .menu-button {
+-  width: 100%;
+-  max-width: none;
++.own-connections-search:focus-within,
++.own-connections-tabs:focus-within,
++.own-connections-dialog input:focus,
++.own-connections-dialog textarea:focus,
++.memory-share-dialog input:focus,
++.memory-share-dialog textarea:focus {
++  outline: 2px solid var(--brand-accent);
++  outline-offset: 2px;
++}
++.own-connections-request {
++  display: inline-flex;
++  align-items: center;
++  justify-content: center;
++  gap: 7px;
++  min-height: 40px;
++}
++.own-connections-notice {
++  margin-top: 14px;
++}
++.own-connections-grid {
++  display: grid;
++  grid-template-columns: repeat(3, minmax(0, 1fr));
++  gap: 14px;
++  padding-top: 20px;
++}
++.own-connection-card {
++  min-width: 0;
++  min-height: 154px;
++  display: flex;
++  flex-direction: column;
+   justify-content: space-between;
+-  height: 38px;
++  gap: 18px;
++  padding: 17px;
+   border: 1px solid var(--border);
+-  background: var(--background);
+-  color: var(--foreground);
+-  padding: 0 10px;
++  border-radius: 12px;
++  background: color-mix(in srgb, var(--background) 96%, var(--secondary));
++  box-shadow: 0 1px 2px color-mix(in srgb, var(--foreground) 5%, transparent);
++  transition: border-color 0.12s ease, box-shadow 0.12s ease, transform 0.12s ease;
+ }
+-.resource-form .form-menu-control .menu-popover {
+-  top: calc(100% + 6px);
+-  bottom: auto;
+-  width: 100%;
+-  max-width: none;
+-  box-sizing: border-box;
++.own-connection-card:hover {
++  border-color: color-mix(in srgb, var(--brand-accent) 35%, var(--border));
++  box-shadow: 0 8px 22px color-mix(in srgb, var(--foreground) 8%, transparent);
++  transform: translateY(-1px);
+ }
+-.field label {
+-  display: block;
+-  font-size: 11px;
+-  font-weight: 400;
+-  color: var(--muted-foreground);
+-  margin-bottom: 4px;
++.own-connection-card.connected {
++  border-top: 3px solid color-mix(in srgb, #16a34a 76%, var(--brand-accent));
++  padding-top: 15px;
+ }
+-.field .value {
+-  font-size: 13px;
++.own-connection-main {
++  display: flex;
++  gap: 13px;
++  align-items: flex-start;
+ }
+-.field .value.pre {
+-  white-space: pre-wrap;
+-  word-break: break-word;
++.own-connection-logo {
++  width: 38px;
++  height: 38px;
++  flex: 0 0 38px;
++  border-radius: 9px;
++  object-fit: contain;
+ }
+-.field .hint {
++.own-connection-logo.fallback {
++  display: grid;
++  place-items: center;
++  background: color-mix(in srgb, var(--brand-accent) 12%, var(--secondary));
++  color: var(--brand-accent);
+   font-size: 12px;
+-  color: var(--muted-foreground);
+-  margin-top: 4px;
++  font-weight: 700;
+ }
+-.actions {
++.own-connection-copy {
++  min-width: 0;
++}
++.own-connection-title-row {
+   display: flex;
+-  flex-wrap: wrap;
+-  gap: 8px;
+   align-items: center;
+-  margin-top: 4px;
++  gap: 7px;
+ }
+-.warn {
+-  font-size: 13px;
+-  padding: 10px 13px;
+-  border-radius: var(--radius-sm);
+-  border: 1px solid var(--destructive, #c00);
+-  color: var(--destructive, #c00);
++.own-connection-title-row h2 {
++  min-width: 0;
++  margin: 0;
++  overflow: hidden;
++  text-overflow: ellipsis;
++  white-space: nowrap;
++  font-size: 15px;
++  font-weight: 650;
+ }
+-.form-error {
++.own-connection-shield {
++  display: grid;
++  place-items: center;
++  width: 18px;
++  height: 18px;
++  flex: 0 0 18px;
++  border-radius: 50%;
++  background: color-mix(in srgb, #16a34a 18%, var(--background));
++  color: #15803d;
++}
++.own-connection-copy p {
++  display: -webkit-box;
++  margin: 5px 0 0;
++  overflow: hidden;
++  color: var(--muted-foreground);
+   font-size: 12px;
+-  color: var(--destructive, #c00);
+-  min-height: 1em;
++  line-height: 1.45;
++  -webkit-box-orient: vertical;
++  -webkit-line-clamp: 2;
+ }
+-
+-.signin {
+-  height: 100vh;
+-  height: 100dvh;
++.own-connection-foot {
+   display: flex;
+   align-items: center;
++  justify-content: space-between;
++  gap: 10px;
++}
++.own-connection-foot .btn {
++  display: inline-flex;
++  align-items: center;
+   justify-content: center;
+-  padding: 24px;
+-  box-sizing: border-box;
++  gap: 6px;
++  white-space: nowrap;
+ }
+-.signin form {
+-  display: flex;
+-  flex-direction: column;
+-  gap: 12px;
+-  width: 340px;
+-  max-width: 100%;
++.own-connection-count {
++  color: var(--muted-foreground);
++  font-size: 12px;
+ }
+-.signin-brand {
++.own-connection-count.active {
++  color: #15803d;
++  font-weight: 650;
++}
++.own-connections-more {
+   display: flex;
+-  align-items: center;
+-  gap: 9px;
+-  font-size: 17px;
+-  font-weight: 600;
+-  letter-spacing: 0;
+-  margin-bottom: 4px;
++  justify-content: center;
++  padding: 22px 0;
+ }
+-.signin-brand .brand-mark {
+-  width: 22px;
+-  height: 22px;
+-  flex-basis: 22px;
+-  font-size: 16px;
++.own-connections-dialog-scrim,
++.memory-share-scrim {
++  position: fixed;
++  inset: 0;
++  z-index: 80;
++  display: grid;
++  place-items: center;
++  padding: 20px;
++  background: color-mix(in srgb, #000 46%, transparent);
+ }
+-.signin h1 {
+-  font-family: var(--app-serif);
+-  font-size: 26px;
+-  font-weight: 500;
+-  letter-spacing: 0;
+-  margin: 0 0 2px;
++.own-connections-dialog,
++.memory-share-dialog {
++  width: min(500px, 100%);
++  box-sizing: border-box;
++  display: flex;
++  flex-direction: column;
++  gap: 14px;
++  padding: 22px;
++  border: 1px solid var(--border);
++  border-radius: var(--radius-lg);
++  background: var(--background);
++  box-shadow: 0 24px 70px color-mix(in srgb, #000 28%, transparent);
++}
++.own-connections-dialog h2,
++.memory-share-dialog h2 {
++  margin: -7px 0 0;
++  font-size: 20px;
++}
++.own-connections-dialog p,
++.memory-share-dialog p {
++  margin: -8px 0 2px;
++  color: var(--muted-foreground);
++  font-size: 13px;
++}
++.own-connections-dialog label,
++.memory-share-dialog label {
++  display: flex;
++  flex-direction: column;
++  gap: 6px;
++  font-size: 12px;
++  font-weight: 650;
++}
++.own-connections-dialog input,
++.own-connections-dialog textarea,
++.memory-share-dialog input,
++.memory-share-dialog textarea {
++  width: 100%;
++  box-sizing: border-box;
++  min-height: 38px;
++  padding: 9px 11px;
++  border: 1px solid var(--border);
++  border-radius: var(--radius-sm);
++  background: var(--background);
++  color: var(--foreground);
++  font: inherit;
++}
++.own-connections-dialog textarea,
++.memory-share-dialog textarea {
++  min-height: 96px;
++  resize: vertical;
++}
++.own-connections-dialog .actions,
++.memory-share-dialog .actions {
++  display: flex;
++  justify-content: flex-end;
++  gap: 8px;
++}
++.memory-privacy-note {
++  display: flex;
++  align-items: flex-start;
++  gap: 10px;
++  padding: 12px 14px;
++  border-left: 3px solid var(--brand-accent);
++  border-radius: 0 var(--radius-md) var(--radius-md) 0;
++  background: color-mix(in srgb, var(--brand-accent) 7%, var(--background));
++  color: var(--brand-accent);
++}
++.memory-privacy-note div {
++  display: flex;
++  flex-direction: column;
++  gap: 2px;
++}
++.memory-privacy-note span {
++  color: var(--muted-foreground);
++  font-size: 12px;
++}
++.memory-fact > div:first-child {
++  min-width: 0;
++}
++.memory-fact-actions {
++  display: flex;
++  align-items: center;
++  gap: 6px;
++  flex: 0 0 auto;
++}
++.memory-fact-actions .btn {
++  display: inline-flex;
++  align-items: center;
++  gap: 5px;
++}
++.memory-share-preview {
++  padding: 12px 14px;
++  border: 1px solid var(--border);
++  border-radius: var(--radius-md);
++  background: color-mix(in srgb, var(--secondary) 50%, var(--background));
++  font-size: 13px;
++  line-height: 1.55;
++}
++
++@media (max-width: 1080px) {
++  .own-connections-grid {
++    grid-template-columns: repeat(2, minmax(0, 1fr));
++  }
++}
++@media (max-width: 720px) {
++  .own-connections-pane {
++    padding: 20px 16px 32px;
++  }
++  .own-connections-hero {
++    padding-left: 13px;
++  }
++  .own-connections-hero-mark {
++    display: none;
++  }
++  .own-connections-toolbar {
++    grid-template-columns: 1fr;
++  }
++  .own-connections-tabs,
++  .own-connections-request {
++    width: 100%;
++  }
++  .own-connections-tabs button {
++    flex: 1;
++  }
++  .own-connections-grid {
++    grid-template-columns: 1fr;
++  }
++  .memory-fact {
++    align-items: flex-start;
++    flex-direction: column;
++  }
++  .memory-fact-actions {
++    width: 100%;
++    flex-wrap: wrap;
++  }
++}
++@media (prefers-reduced-motion: reduce) {
++  .own-connection-card {
++    transition: none;
++  }
++  .own-connection-card:hover {
++    transform: none;
++  }
++}
++
++.resource-pane {
++  flex: 1;
++  min-height: 0;
++  overflow-y: auto;
++  box-sizing: border-box;
++  padding: 32px 24px;
++}
++.resource-detail,
++.resource-form {
++  max-width: 640px;
++  margin: 0 auto;
++  display: flex;
++  flex-direction: column;
++  gap: 16px;
++}
++.resource-detail h2,
++.resource-form h2 {
++  font-size: 20px;
++  font-weight: 600;
++  letter-spacing: 0;
++  margin: 0;
++}
++.resource-heading {
++  display: flex;
++  align-items: center;
++  justify-content: space-between;
++  gap: 12px;
++}
++.resource-heading .btn {
++  display: inline-flex;
++  align-items: center;
++  gap: 7px;
++}
++.copyrow {
++  display: flex;
++  align-items: center;
++  gap: 8px;
++}
++.copyrow .mono {
++  flex: 1;
++  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
++  font-size: 12px;
++  padding: 8px 11px;
++  border: 1px solid var(--border);
++  border-radius: var(--radius-sm);
++  background: var(--secondary);
++  overflow-x: auto;
++  white-space: nowrap;
++}
++.copyrow .btn {
++  flex-shrink: 0;
++}
++.resource-form label {
++  display: flex;
++  flex-direction: column;
++  gap: 6px;
++  font-size: 13px;
++  font-weight: 600;
++}
++.resource-form .hint {
++  font-weight: 400;
++  font-size: 12px;
++  color: var(--muted-foreground);
++}
++.resource-form textarea {
++  font: inherit;
++  font-size: 13px;
++  padding: 9px 11px;
++  border: 1px solid var(--border);
++  border-radius: var(--radius-sm);
++  background: var(--background);
++  color: var(--foreground);
++  width: 100%;
++  box-sizing: border-box;
++  resize: vertical;
++}
++.resource-form textarea:focus,
++.signin input:focus {
++  outline: 2px solid var(--border);
++  outline-offset: 1px;
++}
++.resource-form .form-menu-control {
++  width: 100%;
++}
++.resource-form .form-menu-control .menu-button {
++  width: 100%;
++  max-width: none;
++  justify-content: space-between;
++  height: 38px;
++  border: 1px solid var(--border);
++  background: var(--background);
++  color: var(--foreground);
++  padding: 0 10px;
++}
++.resource-form .form-menu-control .menu-popover {
++  top: calc(100% + 6px);
++  bottom: auto;
++  width: 100%;
++  max-width: none;
++  box-sizing: border-box;
++}
++.field label {
++  display: block;
++  font-size: 11px;
++  font-weight: 400;
++  color: var(--muted-foreground);
++  margin-bottom: 4px;
++}
++.field .value {
++  font-size: 13px;
++}
++.field .value.pre {
++  white-space: pre-wrap;
++  word-break: break-word;
++}
++.field .hint {
++  font-size: 12px;
++  color: var(--muted-foreground);
++  margin-top: 4px;
++}
++.actions {
++  display: flex;
++  flex-wrap: wrap;
++  gap: 8px;
++  align-items: center;
++  margin-top: 4px;
++}
++.warn {
++  font-size: 13px;
++  padding: 10px 13px;
++  border-radius: var(--radius-sm);
++  border: 1px solid var(--destructive, #c00);
++  color: var(--destructive, #c00);
++}
++.form-error {
++  font-size: 12px;
++  color: var(--destructive, #c00);
++  min-height: 1em;
++}
++
++.signin {
++  height: 100vh;
++  height: 100dvh;
++  display: flex;
++  align-items: center;
++  justify-content: center;
++  padding: 24px;
++  box-sizing: border-box;
++}
++.signin form {
++  display: flex;
++  flex-direction: column;
++  gap: 12px;
++  width: 340px;
++  max-width: 100%;
++}
++.signin-brand {
++  display: flex;
++  align-items: center;
++  gap: 9px;
++  font-size: 17px;
++  font-weight: 600;
++  letter-spacing: 0;
++  margin-bottom: 4px;
++}
++.signin-brand .brand-mark {
++  width: 22px;
++  height: 22px;
++  flex-basis: 22px;
++  font-size: 16px;
++}
++.signin-brand .dev-chip {
++  margin-left: auto;
++  padding: 2px 6px;
++  border-radius: 4px;
++  background: var(--dev-accent);
++  color: #fff;
++  font-family: var(--font-mono, ui-monospace, SFMono-Regular, Menlo, monospace);
++  font-size: 10px;
++  font-weight: 700;
++  letter-spacing: 0.1em;
++}
++.signin-body {
++  font-size: 13.5px;
++  color: var(--muted-foreground);
++  line-height: 1.5;
++  margin: -4px 0 2px;
++}
++.signin-body b {
++  font-family: var(--font-mono, ui-monospace, SFMono-Regular, Menlo, monospace);
++  font-size: 0.9em;
++  font-weight: 600;
++  color: var(--foreground);
++}
++.signin label {
++  font-size: 12px;
++  font-weight: 600;
++  color: var(--muted-foreground);
++  margin-bottom: -6px;
++}
++.signin-brand .brand-logo img {
++  width: 230px;
++}
++.signin h1 {
++  font-family: var(--app-serif);
++  font-size: 26px;
++  font-weight: 500;
++  letter-spacing: 0;
++  margin: 0 0 2px;
+ }
+ .signin input {
+   font: inherit;
+@@ -7444,6 +7874,133 @@ a.connector-widget:focus-visible {
+     flex-wrap: wrap;
+   }
+ }
++
++/* Admin-first Company Brain relationship view. */
++.brain-map-pane { min-height: 100%; padding: 28px; box-sizing: border-box; overflow-y: auto; background: var(--background); }
++.brain-map-head { display: flex; align-items: flex-start; justify-content: space-between; gap: 24px; margin-bottom: 18px; }
++.brain-map-head h1 { margin: 3px 0 5px; font-size: 28px; letter-spacing: -0.035em; }
++.brain-map-head p { margin: 0; max-width: 680px; color: var(--muted-foreground); }
++.brain-map-head .eyebrow { color: var(--brand-accent); font-size: 10px; font-weight: 750; letter-spacing: .12em; text-transform: uppercase; }
++.brain-map-trust { display: inline-flex; align-items: center; gap: 7px; flex: 0 0 auto; border: 1px solid color-mix(in srgb, var(--brand-accent) 32%, var(--border)); border-radius: 999px; padding: 7px 10px; color: var(--muted-foreground); font-size: 11px; }
++.brain-map-filters { display: grid; grid-template-columns: minmax(260px, 1fr) minmax(170px, .35fr) 150px auto auto; gap: 8px; align-items: center; }
++.brain-map-filters input, .brain-map-filters select { box-sizing: border-box; width: 100%; height: 36px; border: 1px solid var(--border); border-radius: var(--radius-sm); padding: 0 10px; background: var(--background); color: var(--foreground); font: inherit; }
++.brain-map-filters input:focus, .brain-map-filters select:focus { outline: 2px solid color-mix(in srgb, var(--brand-accent) 28%, transparent); outline-offset: 1px; }
++.brain-search { position: relative; display: block; }
++.brain-search svg { position: absolute; left: 10px; top: 10px; color: var(--muted-foreground); }
++.brain-search input { padding-left: 32px; }
++.brain-map-notice { margin-top: 10px; border: 1px solid var(--border); border-radius: var(--radius-sm); padding: 9px 11px; color: var(--muted-foreground); font-size: 12px; }
++.brain-map-stats { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 10px; margin: 16px 0 12px; }
++.brain-map-stats > div { border: 1px solid var(--border); border-radius: var(--radius-md); padding: 12px 14px; background: color-mix(in srgb, var(--secondary) 24%, var(--background)); }
++.brain-map-stats strong { display: block; font-size: 20px; }
++.brain-map-stats span { color: var(--muted-foreground); font-size: 10px; text-transform: uppercase; letter-spacing: .08em; }
++.brain-map-workbench { min-height: 560px; display: grid; grid-template-columns: minmax(0, 1fr) 300px; border: 1px solid var(--border); border-radius: var(--radius-lg); overflow: hidden; background: color-mix(in srgb, var(--secondary) 12%, var(--background)); }
++.brain-graph-panel { min-width: 0; border-right: 1px solid var(--border); }
++.brain-graph-title { height: 44px; display: flex; align-items: center; gap: 7px; box-sizing: border-box; border-bottom: 1px solid var(--border); padding: 0 14px; color: var(--muted-foreground); font-size: 11px; font-weight: 700; text-transform: uppercase; letter-spacing: .08em; }
++.brain-canvas-scroll { min-height: 515px; overflow: auto; background-image: radial-gradient(color-mix(in srgb, var(--border) 75%, transparent) 1px, transparent 1px); background-size: 18px 18px; }
++.brain-canvas { display: block; }
++.brain-edges line { stroke: color-mix(in srgb, var(--brand-accent) 42%, var(--border)); stroke-width: 1.5; }
++.brain-node { cursor: pointer; outline: none; }
++.brain-node rect { fill: var(--background); stroke: var(--border); stroke-width: 1.2; filter: drop-shadow(0 4px 8px rgba(0,0,0,.08)); }
++.brain-node:hover rect, .brain-node:focus rect, .brain-node.selected rect { stroke: var(--brand-accent); stroke-width: 2; }
++.brain-node.selected rect { fill: color-mix(in srgb, var(--brand-accent) 9%, var(--background)); }
++.brain-node-label { fill: var(--foreground); font-size: 11px; font-weight: 700; }
++.brain-node-meta { fill: var(--muted-foreground); font-size: 8.5px; text-transform: uppercase; }
++.brain-detail-panel { min-width: 0; background: var(--background); overflow-y: auto; }
++.brain-detail-head { padding: 18px; border-bottom: 1px solid var(--border); }
++.brain-detail-head h2 { margin: 5px 0; font-size: 18px; }
++.brain-detail-head p { margin: 0; color: var(--muted-foreground); font-size: 11px; }
++.brain-node-type { color: var(--brand-accent); font-size: 9px; font-weight: 750; text-transform: uppercase; letter-spacing: .1em; }
++.brain-record-list { padding: 12px; }
++.brain-record { margin-bottom: 9px; border: 1px solid var(--border); border-radius: var(--radius-sm); padding: 11px; }
++.brain-record > div { display: flex; justify-content: space-between; gap: 8px; color: var(--muted-foreground); font-size: 9px; text-transform: uppercase; letter-spacing: .06em; }
++.brain-record strong { display: block; margin: 7px 0; font-size: 12px; line-height: 1.35; }
++.brain-record a { display: inline-flex; align-items: center; gap: 4px; color: var(--brand-accent); font-size: 10px; text-decoration: none; }
++.brain-map-empty { min-height: 180px; display: flex; align-items: center; justify-content: center; flex-direction: column; gap: 6px; padding: 20px; text-align: center; color: var(--muted-foreground); }
++.brain-map-empty strong { color: var(--foreground); }
++
++@media (max-width: 980px) {
++  .brain-map-filters { grid-template-columns: 1fr 1fr 140px auto; }
++  .brain-map-filters .brain-search { grid-column: 1 / -1; }
++  .brain-map-workbench { grid-template-columns: 1fr; }
++  .brain-graph-panel { border-right: 0; border-bottom: 1px solid var(--border); }
++  .brain-detail-panel { min-height: 240px; }
++}
++@media (max-width: 620px) {
++  .brain-map-pane { padding: 16px; }
++  .brain-map-head { flex-direction: column; }
++  .brain-map-filters { grid-template-columns: 1fr; }
++  .brain-map-filters .brain-search { grid-column: auto; }
++  .brain-map-stats { grid-template-columns: repeat(2, 1fr); }
++}
++
++/* Broader operational topology: lanes, evidence, freshness, and drill-down. */
++.brain-map-pane { padding: 30px; background: linear-gradient(145deg, color-mix(in srgb, var(--brand-accent) 3%, var(--background)), var(--background) 380px); }
++.brain-map-head { margin-bottom: 20px; }
++.brain-map-head h1 { margin-bottom: 7px; font-size: clamp(28px, 3vw, 38px); line-height: 1; letter-spacing: -.045em; }
++.brain-map-head p { max-width: 760px; line-height: 1.5; }
++.brain-map-trust { border: 0; border-left: 3px solid var(--brand-accent); border-radius: 0; padding: 5px 0 5px 10px; }
++.brain-map-filters { grid-template-columns: minmax(300px, 1fr) minmax(180px, .35fr) 155px auto auto; }
++.brain-map-filters input, .brain-map-filters select { height: 38px; }
++.brain-search svg { top: 11px; }
++.brain-map-stats { grid-template-columns: repeat(5, minmax(0, 1fr)); gap: 0; margin: 22px 0 0; border-block: 1px solid var(--border); }
++.brain-map-stats > div { border: 0; border-right: 1px solid var(--border); border-radius: 0; padding: 15px 18px; background: color-mix(in srgb, var(--background) 93%, var(--brand-accent)); }
++.brain-map-stats > div:last-child { border-right: 0; }
++.brain-map-stats strong { font-size: 24px; line-height: 1; font-variant-numeric: tabular-nums; }
++.brain-map-stats span { display: block; margin-top: 7px; font-size: 9px; letter-spacing: .1em; }
++.brain-map-pulse { display: flex; align-items: center; justify-content: space-between; gap: 16px; padding: 11px 2px; color: var(--muted-foreground); font-size: 11px; }
++.brain-map-pulse > div { display: flex; align-items: center; gap: 7px; color: var(--foreground); }
++.brain-live-dot, .brain-muted-dot { display: inline-block; width: 7px; height: 7px; border-radius: 50%; background: var(--brand-accent); box-shadow: 0 0 0 4px color-mix(in srgb, var(--brand-accent) 13%, transparent); }
++.brain-muted-dot { background: var(--muted-foreground); box-shadow: none; }
++.brain-map-legend { display: flex; gap: 7px 15px; flex-wrap: wrap; min-height: 28px; align-items: center; margin-bottom: 8px; color: var(--muted-foreground); font-size: 10px; }
++.brain-map-legend span { display: inline-flex; align-items: center; gap: 5px; }
++.brain-map-legend i { width: 7px; height: 7px; border-radius: 2px; background: #58bf4b; }
++.brain-map-legend b { color: var(--foreground); font-variant-numeric: tabular-nums; }
++.brain-legend-person i { background: #2e7fb9; }.brain-legend-department i { background: #7656a7; }.brain-legend-project i,.brain-legend-campaign i { background: #d1933b; }.brain-legend-tool-account i,.brain-legend-location i { background: #0e8f80; }
++.brain-map-workbench { min-height: 620px; grid-template-columns: minmax(0, 1fr) 330px; border-radius: 0; box-shadow: 0 18px 45px rgba(5,25,50,.08); }
++.brain-graph-title { min-height: 46px; height: auto; font-size: 10px; font-weight: 750; letter-spacing: .09em; }
++.brain-graph-title span { margin-left: auto; font-weight: 500; text-transform: none; letter-spacing: 0; }
++.brain-canvas-scroll { min-height: 573px; background: linear-gradient(90deg, color-mix(in srgb, var(--brand-accent) 2%, transparent), transparent 24%), radial-gradient(color-mix(in srgb, var(--border) 65%, transparent) 1px, transparent 1px); background-size: auto, 18px 18px; }
++.brain-lanes line { stroke: color-mix(in srgb, var(--border) 55%, transparent); stroke-dasharray: 3 7; }
++.brain-lanes text { fill: var(--foreground); font-size: 9px; font-weight: 800; letter-spacing: .08em; text-transform: uppercase; }
++.brain-lanes .brain-lane-count { fill: var(--muted-foreground); font-size: 8px; font-weight: 500; }
++.brain-edges path { fill: none; stroke: color-mix(in srgb, var(--brand-accent) 40%, var(--border)); stroke-width: 1.4; opacity: .75; }
++.brain-edges path.evidence { stroke: color-mix(in srgb, #d1933b 62%, var(--border)); stroke-dasharray: 4 4; }
++.brain-node rect { stroke-width: 1.1; filter: drop-shadow(0 5px 10px rgba(0,0,0,.08)); }
++.brain-node circle { fill: #58bf4b; }.brain-node-person circle { fill: #2e7fb9; }.brain-node-department circle { fill: #7656a7; }.brain-node-project circle,.brain-node-campaign circle { fill: #d1933b; }.brain-node-tool-account circle,.brain-node-location circle { fill: #0e8f80; }
++.brain-node-label { font-size: 10.5px; font-weight: 720; }
++.brain-node-meta { font-size: 8px; letter-spacing: .03em; }
++.brain-detail-panel { max-height: 620px; }
++.brain-detail-head { padding: 20px; }
++.brain-detail-head h2 { margin: 7px 0; font-size: 20px; line-height: 1.2; }
++.brain-detail-head p { line-height: 1.45; }
++.brain-detail-kicker { display: flex; align-items: center; gap: 7px; color: var(--muted-foreground); font-size: 9px; text-transform: uppercase; letter-spacing: .08em; }
++.brain-detail-kicker span + span { border-left: 1px solid var(--border); padding-left: 7px; }
++.brain-detail-section { padding: 15px 16px; border-bottom: 1px solid var(--border); }
++.brain-detail-section h3 { display: flex; align-items: center; justify-content: space-between; margin: 0 0 9px; font-size: 10px; text-transform: uppercase; letter-spacing: .09em; }
++.brain-detail-section h3 span { color: var(--muted-foreground); font-weight: 500; }
++.brain-detail-muted { margin: 0; color: var(--muted-foreground); font-size: 11px; line-height: 1.45; }
++.brain-neighbor-list { display: grid; gap: 1px; }
++.brain-neighbor-list button { display: flex; flex-direction: column; gap: 3px; border: 0; border-left: 2px solid transparent; padding: 8px 9px; background: transparent; color: var(--foreground); text-align: left; cursor: pointer; }
++.brain-neighbor-list button:hover, .brain-neighbor-list button:focus { border-left-color: var(--brand-accent); background: color-mix(in srgb, var(--secondary) 45%, transparent); outline: none; }
++.brain-neighbor-list span { font-size: 11px; font-weight: 650; }.brain-neighbor-list small { color: var(--muted-foreground); font-size: 9px; }
++.brain-detail-section .brain-record-list { padding: 0; gap: 8px; }
++.brain-detail-section .brain-record { margin: 0; border: 0; border-left: 2px solid color-mix(in srgb, #d1933b 75%, var(--border)); border-radius: 0; padding: 9px 0 9px 10px; }
++
++@media (max-width: 1080px) {
++  .brain-map-stats { grid-template-columns: repeat(3, 1fr); }.brain-map-stats > div:nth-child(3) { border-right: 0; }
++  .brain-detail-panel { min-height: 260px; max-height: none; }
++}
++@media (max-width: 760px) {
++  .brain-map-pane { padding: 18px; }.brain-map-trust { align-self: stretch; }
++  .brain-map-filters { grid-template-columns: 1fr 1fr auto; }.brain-map-filters .brain-search { grid-column: 1 / -1; }
++  .brain-map-pulse { align-items: flex-start; flex-direction: column; }
++}
++@media (max-width: 520px) {
++  .brain-map-filters { grid-template-columns: 1fr; }.brain-map-filters .brain-search { grid-column: auto; }
++  .brain-map-stats { grid-template-columns: repeat(2, 1fr); }.brain-map-stats > div { border-right: 1px solid var(--border); }.brain-map-stats > div:nth-child(even) { border-right: 0; }
++  .brain-graph-title span { display: none; }
++}
++@media (prefers-reduced-motion: reduce) { .brain-node rect, .brain-edges path { transition: none; } }
+ .cron-row {
+   display: grid;
+   grid-template-columns: minmax(0, 1fr) auto;
+@@ -11869,305 +12426,775 @@ body.app-edit-embed .custom-chat-shell.app-edit-chat > .chat-bottom-dock {
+   left: auto;
+   right: 0;
+ }
+-.permission-control .menu-option {
+-  font-size: 12px;
++.permission-control .menu-option {
++  font-size: 12px;
++}
++.permission-invite {
++  display: grid;
++  grid-template-columns: 1fr auto;
++  gap: 12px;
++  padding: 12px;
++  border: 1px solid var(--border);
++  border-radius: var(--radius-sm);
++}
++.permission-invite-actions {
++  grid-column: 1 / -1;
++  display: flex;
++  align-items: center;
++  justify-content: space-between;
++}
++.permission-note {
++  font-size: 12px;
++  color: var(--muted-foreground);
++  margin: 10px 0 0;
++}
++.deployment-permissions-dialog .project-dialog-actions {
++  margin-top: 20px;
++}
++
++.deployment-permissions-dialog .permission-control .menu-popover {
++  position: absolute !important;
++  inset: calc(100% + 6px) 0 auto auto !important;
++  width: 170px !important;
++  min-width: 170px;
++  max-height: 220px !important;
++  padding: 4px;
++  border: 1px solid var(--border);
++  border-radius: var(--radius-sm);
++  animation: none;
++}
++.deployment-permissions-dialog .permission-control .menu-popover::after {
++  display: none;
++}
++.deployment-permissions-dialog .permission-control .menu-option {
++  min-height: 34px;
++  padding: 6px 10px;
++}
++.deployment-permissions-dialog .permission-invite .menu-popover {
++  inset: calc(100% + 6px) auto auto 0 !important;
++}
++.deployment-permissions-dialog .permission-control .menu-popover.drop-up {
++  top: auto !important;
++  bottom: calc(100% + 6px) !important;
++}
++
++.deploy-access-line + .deploy-detail-section {
++  border-top: 0;
++  padding-top: 0;
++}
++.deploy-detail .deploy-setting-row {
++  grid-template-columns: minmax(0, 1fr) auto;
++  gap: 16px;
++  padding: 12px 0;
++}
++.deploy-detail .deploy-setting-value {
++  justify-content: flex-end;
++}
++.deploy-detail .deploy-setting-row > div:first-child span {
++  max-width: 250px;
++}
++@media (max-width: 520px) {
++  .deploy-detail .deploy-setting-row {
++    grid-template-columns: minmax(0, 1fr);
++    gap: 8px;
++  }
++  .deploy-detail .deploy-setting-value {
++    justify-content: flex-start;
++  }
++}
++
++.conversation-error {
++  margin: auto;
++  padding: 48px 24px;
++  max-width: 480px;
++  text-align: center;
++}
++.conversation-error-code {
++  color: var(--muted-foreground);
++  font-size: 13px;
++}
++.conversation-error h1 {
++  outline: none;
++  margin: 12px 0;
++  font-size: 24px;
++  font-weight: 600;
++}
++.conversation-error p {
++  color: var(--muted-foreground);
++  line-height: 1.6;
++}
++.conversation-error-actions {
++  display: flex;
++  justify-content: center;
++  gap: 12px;
++  margin-top: 24px;
++}
++
++.session-parent-link {
++  display: inline-flex;
++  align-items: center;
++  gap: 6px;
++  min-width: 0;
++  max-width: 35%;
++  padding: 5px 7px;
++  border: 0;
++  border-radius: 6px;
++  background: transparent;
++  color: var(--muted-foreground);
++  font: inherit;
++  font-size: 13px;
++  cursor: pointer;
++}
++.session-parent-link span {
++  overflow: hidden;
++  text-overflow: ellipsis;
++  white-space: nowrap;
++}
++.session-parent-link .icon {
++  flex: none;
++}
++.session-parent-link:hover {
++  background: var(--muted);
++  color: var(--foreground);
++}
++.session-parent-link:focus-visible {
++  outline: 2px solid var(--foreground);
++  outline-offset: 2px;
++}
++.assistant-row:has(.subagent-chip) .work-said {
++  margin: 6px 0;
++}
++.assistant-row:has(.subagent-chip) .work-head {
++  font-size: 13px;
++}
++.subagent-mail-row .subagent-chip {
++  padding: 2px 8px;
++  font-size: 12px;
++  background: transparent;
++}
++.subagent-mail-row + .assistant-row {
++  margin-bottom: 8px;
++}
++
++.inbox-sent-row {
++  text-decoration: none;
++}
++.inbox-sent-more {
++  margin: 16px 0;
++}
++.inbox-sent-actions {
++  justify-content: flex-end;
++}
++.inbox-sent-message .inbox-context-text {
++  margin-top: 8px;
++}
++.inbox-sent-recipients {
++  margin-top: 2px;
++  color: var(--muted-foreground);
++  font-size: 11.5px;
++}
++.inbox-sent-attachments {
++  margin-top: 8px;
++  font-size: 11.5px;
++  color: var(--muted-foreground);
++  overflow-wrap: anywhere;
++}
++
++:is(markdown-block, qm-markdown).markdown-content table {
++  font-size: 13px;
++  line-height: 1.65;
++}
++.activity-group > .work-head {
++  font-size: 14px;
++}
++.stopped-work[open] > .stopped-head > .activity-chevron {
++  transform: rotate(90deg);
++}
++
++.settings-ai-controls {
++  display: flex;
++  flex-direction: column;
++  align-items: flex-end;
++  gap: 8px;
++}
++.mc-simple-flow {
++  display: flex;
++  flex-direction: column;
++  align-items: stretch;
++  gap: 16px;
++}
++.mc-simple-flow > .settings-theme-link {
++  align-self: flex-start;
++}
++
++.mc-overlay .mc-panel h1 {
++  font-family: var(--app-font);
++  font-size: 20px;
++  line-height: 1.3;
++  font-weight: 600;
++  letter-spacing: -0.3px;
++  margin: 0 28px 8px 0;
++}
++.mc-overlay .mc-panel .signin-body {
++  font-size: 13px;
++  line-height: 1.5;
++  margin: 0 0 24px;
++}
++.mc-simple-flow .mc-steps {
++  gap: 16px;
+ }
+-.permission-invite {
+-  display: grid;
+-  grid-template-columns: 1fr auto;
+-  gap: 12px;
+-  padding: 12px;
+-  border: 1px solid var(--border);
+-  border-radius: var(--radius-sm);
++.mc-simple-flow .mc-steps .btn {
++  width: 100%;
++  min-height: 36px;
++  justify-content: center;
+ }
+-.permission-invite-actions {
+-  grid-column: 1 / -1;
+-  display: flex;
+-  align-items: center;
+-  justify-content: space-between;
++.mc-simple-flow .mc-field > span {
++  font-weight: 400;
++  margin-bottom: 2px;
+ }
+-.permission-note {
++.mc-simple-flow > .settings-theme-link {
+   font-size: 12px;
++  text-decoration: none;
+   color: var(--muted-foreground);
+-  margin: 10px 0 0;
+-}
+-.deployment-permissions-dialog .project-dialog-actions {
+-  margin-top: 20px;
+-}
+-
+-.deployment-permissions-dialog .permission-control .menu-popover {
+-  position: absolute !important;
+-  inset: calc(100% + 6px) 0 auto auto !important;
+-  width: 170px !important;
+-  min-width: 170px;
+-  max-height: 220px !important;
+-  padding: 4px;
+-  border: 1px solid var(--border);
+-  border-radius: var(--radius-sm);
+-  animation: none;
+ }
+-.deployment-permissions-dialog .permission-control .menu-popover::after {
+-  display: none;
++.mc-simple-flow > .settings-theme-link:hover {
++  color: var(--foreground);
++  text-decoration: underline;
+ }
+-.deployment-permissions-dialog .permission-control .menu-option {
+-  min-height: 34px;
+-  padding: 6px 10px;
++.settings-ai-controls .settings-choice {
++  flex-wrap: wrap;
+ }
+-.deployment-permissions-dialog .permission-invite .menu-popover {
+-  inset: calc(100% + 6px) auto auto 0 !important;
++
++@container split-pane (max-height: 480px) {
++  .composer-wrap {
++    display: grid;
++    grid-template-columns: minmax(0, 1fr) auto;
++    align-items: center;
++    gap: 6px;
++    padding: 6px;
++    border-radius: 16px;
++  }
++  .composer-wrap > * {
++    grid-column: 1 / -1;
++  }
++  .composer-wrap .composer-input {
++    grid-column: 1;
++    min-width: 0;
++    min-height: 34px;
++    max-height: 120px;
++    padding: 6px 8px;
++  }
++  .composer-wrap .composer-input::placeholder {
++    white-space: nowrap;
++  }
++  .composer-wrap .composer-toolbar {
++    grid-column: 2;
++    flex-wrap: nowrap;
++    gap: 4px;
++  }
++  .composer-wrap .composer-left,
++  .composer-wrap .composer-right {
++    width: auto;
++    flex-wrap: nowrap;
++    gap: 4px;
++  }
++  .composer-wrap .composer-toolbar .menu-button.loadout-button {
++    max-width: 180px;
++  }
+ }
+-.deployment-permissions-dialog .permission-control .menu-popover.drop-up {
+-  top: auto !important;
+-  bottom: calc(100% + 6px) !important;
++
++@container split-pane (max-height: 480px) and (max-width: 470px) {
++  .composer-wrap .loadout-button .menu-label,
++  .composer-wrap .loadout-button .menu-suffix {
++    display: none;
++  }
++  .composer-wrap .composer-toolbar .menu-button.loadout-button {
++    width: 34px;
++    padding: 0;
++    justify-content: center;
++  }
+ }
+ 
+-.deploy-access-line + .deploy-detail-section {
+-  border-top: 0;
+-  padding-top: 0;
++@container split-pane (max-height: 480px) and (max-width: 300px) {
++  .composer-wrap .composer-toolbar .icon-btn,
++  .composer-wrap .composer-toolbar .menu-button.loadout-button,
++  .composer-wrap .composer-toolbar .send-btn,
++  .composer-wrap .composer-toolbar .stop-btn {
++    width: 28px;
++    height: 28px;
++    min-height: 28px;
++  }
++  .composer-wrap .composer-attach {
++    transform: none;
++  }
+ }
+-.deploy-detail .deploy-setting-row {
+-  grid-template-columns: minmax(0, 1fr) auto;
+-  gap: 16px;
+-  padding: 12px 0;
++
++/* Unified inbox — a live, private view over the signed-in teammate's accounts. */
++.unified-inbox-pane {
++  overflow: hidden;
++  display: flex;
++  flex-direction: column;
++  gap: 14px;
++  padding: 22px;
+ }
+-.deploy-detail .deploy-setting-value {
+-  justify-content: flex-end;
++.inbox-head,
++.inbox-toolbar,
++.inbox-row,
++.inbox-row-top,
++.inbox-thread-head,
++.inbox-composer-foot,
++.inbox-head-actions,
++.inbox-source-filters {
++  display: flex;
++  align-items: center;
+ }
+-.deploy-detail .deploy-setting-row > div:first-child span {
+-  max-width: 250px;
++.inbox-head {
++  justify-content: space-between;
++  gap: 20px;
+ }
+-@media (max-width: 520px) {
+-  .deploy-detail .deploy-setting-row {
+-    grid-template-columns: minmax(0, 1fr);
+-    gap: 8px;
+-  }
+-  .deploy-detail .deploy-setting-value {
+-    justify-content: flex-start;
+-  }
++.inbox-head h1,
++.inbox-thread-head h2,
++.inbox-confirm h2,
++.inbox-thread-welcome h2 {
++  margin: 0;
++  color: var(--foreground);
+ }
+-
+-.conversation-error {
+-  margin: auto;
+-  padding: 48px 24px;
+-  max-width: 480px;
+-  text-align: center;
++.inbox-head h1 {
++  font-size: 25px;
++  letter-spacing: -0.025em;
+ }
+-.conversation-error-code {
++.inbox-head p,
++.inbox-thread-head p,
++.inbox-thread-welcome p {
++  margin: 3px 0 0;
+   color: var(--muted-foreground);
+-  font-size: 13px;
+ }
+-.conversation-error h1 {
+-  outline: none;
+-  margin: 12px 0;
+-  font-size: 24px;
+-  font-weight: 600;
+-}
+-.conversation-error p {
++.inbox-kicker {
++  display: block;
+   color: var(--muted-foreground);
+-  line-height: 1.6;
++  font-size: 10px;
++  font-weight: 700;
++  letter-spacing: 0.1em;
++  text-transform: uppercase;
++  margin-bottom: 3px;
+ }
+-.conversation-error-actions {
+-  display: flex;
+-  justify-content: center;
++.inbox-head-actions,
++.inbox-source-filters {
++  gap: 7px;
++}
++.inbox-toolbar {
++  justify-content: space-between;
+   gap: 12px;
+-  margin-top: 24px;
++  padding-bottom: 12px;
++  border-bottom: 1px solid var(--border);
+ }
+-
+-.session-parent-link {
++.inbox-source-filters {
++  flex-wrap: wrap;
++}
++.inbox-source-filters > button {
++  appearance: none;
+   display: inline-flex;
+   align-items: center;
+   gap: 6px;
++  border: 1px solid var(--border);
++  border-radius: 999px;
++  background: var(--background);
++  color: var(--muted-foreground);
++  padding: 5px 10px 5px 6px;
++  font: inherit;
++  font-size: 12px;
++  cursor: pointer;
++}
++.inbox-source-filters > button.active {
++  border-color: color-mix(in srgb, var(--foreground) 28%, var(--border));
++  color: var(--foreground);
++  background: color-mix(in srgb, var(--secondary) 70%, var(--background));
++}
++.inbox-source-mark {
++  width: 22px;
++  height: 22px;
++  flex: 0 0 22px;
++  display: inline-flex;
++  align-items: center;
++  justify-content: center;
++  border-radius: 6px;
++  color: white;
++  font-size: 10px;
++  font-weight: 800;
++}
++.inbox-source-mark.gmail,
++.inbox-row-accent.gmail { background: #d64b3f; }
++.inbox-source-mark.outlook,
++.inbox-row-accent.outlook { background: #2474c6; }
++.inbox-source-mark.slack,
++.inbox-row-accent.slack { background: #6d3f78; }
++.inbox-search {
++  width: min(320px, 42vw);
++  display: flex;
++  align-items: center;
++  gap: 8px;
++  border: 1px solid var(--border);
++  border-radius: var(--radius-sm);
++  padding: 7px 10px;
++  color: var(--muted-foreground);
++  background: var(--background);
++}
++.inbox-search:focus-within {
++  border-color: var(--primary, var(--brand-accent));
++  box-shadow: 0 0 0 2px color-mix(in srgb, var(--primary, var(--brand-accent)) 15%, transparent);
++}
++.inbox-search input {
++  width: 100%;
+   min-width: 0;
+-  max-width: 35%;
+-  padding: 5px 7px;
+   border: 0;
+-  border-radius: 6px;
++  outline: 0;
+   background: transparent;
+-  color: var(--muted-foreground);
++  color: var(--foreground);
+   font: inherit;
+-  font-size: 13px;
+-  cursor: pointer;
+ }
+-.session-parent-link span {
++.inbox-notice {
++  margin: -4px 0 0 !important;
++}
++.inbox-workbench {
++  flex: 1;
++  min-height: 0;
++  display: grid;
++  grid-template-columns: minmax(280px, 34%) minmax(0, 1fr);
++  border: 1px solid var(--border);
++  border-radius: var(--radius-lg);
+   overflow: hidden;
+-  text-overflow: ellipsis;
+-  white-space: nowrap;
++  background: var(--background);
++  box-shadow: 0 10px 30px color-mix(in srgb, #000 5%, transparent);
+ }
+-.session-parent-link .icon {
+-  flex: none;
++.inbox-list {
++  min-width: 0;
++  overflow-y: auto;
++  border-right: 1px solid var(--border);
++  background: color-mix(in srgb, var(--secondary) 24%, var(--background));
+ }
+-.session-parent-link:hover {
+-  background: var(--muted);
++.inbox-row {
++  position: relative;
++  width: 100%;
++  min-width: 0;
++  gap: 10px;
++  border: 0;
++  border-bottom: 1px solid var(--border);
++  background: transparent;
+   color: var(--foreground);
++  padding: 13px 14px 13px 16px;
++  text-align: left;
++  font: inherit;
++  cursor: pointer;
++}
++.inbox-row:hover,
++.inbox-row.active {
++  background: color-mix(in srgb, var(--secondary) 70%, var(--background));
+ }
+-.session-parent-link:focus-visible {
+-  outline: 2px solid var(--foreground);
+-  outline-offset: 2px;
++.inbox-row.active {
++  box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--brand-accent) 22%, transparent);
+ }
+-.assistant-row:has(.subagent-chip) .work-said {
+-  margin: 6px 0;
++.inbox-row-accent {
++  position: absolute;
++  inset: 9px auto 9px 0;
++  width: 3px;
++  border-radius: 0 3px 3px 0;
+ }
+-.assistant-row:has(.subagent-chip) .work-head {
+-  font-size: 13px;
++.inbox-row-copy {
++  display: block;
++  min-width: 0;
++  flex: 1;
+ }
+-.subagent-mail-row .subagent-chip {
+-  padding: 2px 8px;
+-  font-size: 12px;
+-  background: transparent;
++.inbox-row-top {
++  justify-content: space-between;
++  gap: 8px;
+ }
+-.subagent-mail-row + .assistant-row {
+-  margin-bottom: 8px;
++.inbox-row-top strong,
++.inbox-row-title,
++.inbox-row-preview {
++  display: block;
++  white-space: nowrap;
++  overflow: hidden;
++  text-overflow: ellipsis;
+ }
+-
+-.inbox-sent-row {
+-  text-decoration: none;
++.inbox-row-top strong {
++  font-size: 12.5px;
++  font-weight: 550;
+ }
+-.inbox-sent-more {
+-  margin: 16px 0;
++.inbox-row.unread .inbox-row-top strong,
++.inbox-row.unread .inbox-row-title {
++  font-weight: 750;
+ }
+-.inbox-sent-actions {
+-  justify-content: flex-end;
++.inbox-row time,
++.inbox-message-meta time {
++  flex: 0 0 auto;
++  color: var(--muted-foreground);
++  font-size: 10.5px;
+ }
+-.inbox-sent-message .inbox-context-text {
+-  margin-top: 8px;
++.inbox-row-title {
++  margin-top: 2px;
++  font-size: 12.5px;
+ }
+-.inbox-sent-recipients {
++.inbox-row-preview {
+   margin-top: 2px;
+   color: var(--muted-foreground);
+   font-size: 11.5px;
+ }
+-.inbox-sent-attachments {
+-  margin-top: 8px;
+-  font-size: 11.5px;
++.inbox-list-state,
++.inbox-thread-empty,
++.inbox-thread-welcome {
++  display: flex;
++  flex-direction: column;
++  align-items: center;
++  justify-content: center;
++  gap: 8px;
+   color: var(--muted-foreground);
+-  overflow-wrap: anywhere;
+-}
+-
+-:is(markdown-block, qm-markdown).markdown-content table {
+-  font-size: 13px;
+-  line-height: 1.65;
++  text-align: center;
++  padding: 34px 22px;
+ }
+-.activity-group > .work-head {
+-  font-size: 14px;
++.inbox-list-state span {
++  font-size: 12px;
+ }
+-.stopped-work[open] > .stopped-head > .activity-chevron {
+-  transform: rotate(90deg);
++.inbox-thread {
++  min-width: 0;
++  min-height: 0;
++  display: grid;
++  grid-template-rows: auto minmax(0, 1fr) auto;
++  background: var(--background);
+ }
+-
+-.settings-ai-controls {
++.inbox-thread-welcome {
+   display: flex;
+-  flex-direction: column;
+-  align-items: flex-end;
+-  gap: 8px;
++  height: 100%;
++  box-sizing: border-box;
+ }
+-.mc-simple-flow {
+-  display: flex;
+-  flex-direction: column;
+-  align-items: stretch;
++.inbox-thread-welcome svg {
++  color: color-mix(in srgb, var(--brand-accent) 75%, var(--muted-foreground));
++}
++.inbox-thread-head {
++  min-height: 70px;
++  justify-content: space-between;
+   gap: 16px;
++  padding: 13px 18px;
++  border-bottom: 1px solid var(--border);
+ }
+-.mc-simple-flow > .settings-theme-link {
+-  align-self: flex-start;
++.inbox-thread-head h2,
++.inbox-confirm h2,
++.inbox-thread-welcome h2 {
++  font-size: 17px;
++  letter-spacing: -0.012em;
+ }
+-
+-.mc-overlay .mc-panel h1 {
+-  font-family: var(--app-font);
+-  font-size: 20px;
+-  line-height: 1.3;
+-  font-weight: 600;
+-  letter-spacing: -0.3px;
+-  margin: 0 28px 8px 0;
++.inbox-thread-head p {
++  font-size: 11.5px;
+ }
+-.mc-overlay .mc-panel .signin-body {
++.inbox-messages {
++  min-height: 0;
++  overflow-y: auto;
++  padding: 18px;
++  background: color-mix(in srgb, var(--secondary) 12%, var(--background));
++}
++.inbox-message {
++  width: min(78%, 680px);
++  box-sizing: border-box;
++  margin: 0 0 12px;
++  padding: 11px 13px;
++  border: 1px solid var(--border);
++  border-radius: 6px 14px 14px;
++  background: var(--background);
++}
++.inbox-message.outgoing {
++  margin-left: auto;
++  border-radius: 14px 6px 14px 14px;
++  background: color-mix(in srgb, var(--brand-accent) 8%, var(--background));
++}
++.inbox-message-meta {
++  display: flex;
++  align-items: center;
++  justify-content: space-between;
++  gap: 10px;
++  margin-bottom: 5px;
++  font-size: 11px;
++}
++.inbox-message p {
++  margin: 0;
++  color: var(--foreground);
++  white-space: pre-wrap;
++  overflow-wrap: anywhere;
+   font-size: 13px;
+-  line-height: 1.5;
+-  margin: 0 0 24px;
+ }
+-.mc-simple-flow .mc-steps {
+-  gap: 16px;
++.inbox-composer {
++  padding: 12px;
++  border-top: 1px solid var(--border);
++  background: var(--background);
+ }
+-.mc-simple-flow .mc-steps .btn {
++.inbox-composer textarea,
++.inbox-compose-fields input,
++.inbox-compose-fields select {
++  box-sizing: border-box;
+   width: 100%;
+-  min-height: 36px;
+-  justify-content: center;
++  border: 1px solid var(--border);
++  border-radius: var(--radius-sm);
++  background: var(--background);
++  color: var(--foreground);
++  font: inherit;
+ }
+-.mc-simple-flow .mc-field > span {
+-  font-weight: 400;
+-  margin-bottom: 2px;
++.inbox-composer textarea {
++  min-height: 74px;
++  max-height: 180px;
++  resize: vertical;
++  padding: 10px;
+ }
+-.mc-simple-flow > .settings-theme-link {
+-  font-size: 12px;
+-  text-decoration: none;
++.inbox-composer textarea:focus,
++.inbox-compose-fields input:focus,
++.inbox-compose-fields select:focus {
++  outline: 2px solid color-mix(in srgb, var(--primary, var(--brand-accent)) 28%, transparent);
++  outline-offset: 1px;
++}
++.inbox-compose-fields {
++  display: grid;
++  grid-template-columns: 130px minmax(0, 1fr);
++  gap: 9px;
++  margin-bottom: 9px;
++}
++.inbox-compose-fields label {
+   color: var(--muted-foreground);
++  font-size: 10.5px;
++  font-weight: 650;
+ }
+-.mc-simple-flow > .settings-theme-link:hover {
++.inbox-compose-fields input,
++.inbox-compose-fields select {
++  display: block;
++  margin-top: 3px;
++  padding: 7px 8px;
++}
++.inbox-subject {
++  grid-column: 1 / -1;
++}
++.inbox-composer-foot {
++  justify-content: space-between;
++  gap: 12px;
++  margin-top: 8px;
++  color: var(--muted-foreground);
++  font-size: 10.5px;
++}
++.inbox-composer-foot > span {
++  display: inline-flex;
++  align-items: center;
++  gap: 5px;
++}
++.inbox-confirm-scrim {
++  position: fixed;
++  inset: 0;
++  z-index: 80;
++  display: grid;
++  place-items: center;
++  padding: 20px;
++  background: color-mix(in srgb, #000 48%, transparent);
++}
++.inbox-confirm {
++  width: min(520px, 100%);
++  max-height: min(680px, calc(100dvh - 40px));
++  overflow-y: auto;
++  box-sizing: border-box;
++  border: 1px solid var(--border);
++  border-radius: var(--radius-lg);
++  padding: 20px;
++  background: var(--background);
+   color: var(--foreground);
+-  text-decoration: underline;
++  box-shadow: 0 24px 70px rgba(0, 0, 0, 0.3);
+ }
+-.settings-ai-controls .settings-choice {
+-  flex-wrap: wrap;
++.inbox-confirm > p {
++  margin: 10px 0;
++  color: var(--muted-foreground);
++}
++.inbox-confirm-copy {
++  max-height: 260px;
++  overflow-y: auto;
++  white-space: pre-wrap;
++  overflow-wrap: anywhere;
++  border: 1px solid var(--border);
++  border-radius: var(--radius-sm);
++  padding: 12px;
++  background: color-mix(in srgb, var(--secondary) 35%, var(--background));
++}
++.inbox-confirm-warning {
++  color: var(--destructive, #b42318) !important;
++  font-size: 11.5px;
++}
++.inbox-confirm .actions {
++  justify-content: flex-end;
++  margin-top: 16px;
+ }
+ 
+-@container split-pane (max-height: 480px) {
+-  .composer-wrap {
+-    display: grid;
+-    grid-template-columns: minmax(0, 1fr) auto;
+-    align-items: center;
+-    gap: 6px;
+-    padding: 6px;
+-    border-radius: 16px;
+-  }
+-  .composer-wrap > * {
+-    grid-column: 1 / -1;
+-  }
+-  .composer-wrap .composer-input {
+-    grid-column: 1;
+-    min-width: 0;
+-    min-height: 34px;
+-    max-height: 120px;
+-    padding: 6px 8px;
++@media (max-width: 860px) {
++  .unified-inbox-pane {
++    overflow-y: auto;
++    padding: 16px;
+   }
+-  .composer-wrap .composer-input::placeholder {
+-    white-space: nowrap;
++  .inbox-head,
++  .inbox-toolbar {
++    align-items: stretch;
++    flex-direction: column;
+   }
+-  .composer-wrap .composer-toolbar {
+-    grid-column: 2;
+-    flex-wrap: nowrap;
+-    gap: 4px;
++  .inbox-head-actions {
++    justify-content: flex-end;
+   }
+-  .composer-wrap .composer-left,
+-  .composer-wrap .composer-right {
++  .inbox-search {
+     width: auto;
+-    flex-wrap: nowrap;
+-    gap: 4px;
+-  }
+-  .composer-wrap .composer-toolbar .menu-button.loadout-button {
+-    max-width: 180px;
+   }
+-}
+-
+-@container split-pane (max-height: 480px) and (max-width: 470px) {
+-  .composer-wrap .loadout-button .menu-label,
+-  .composer-wrap .loadout-button .menu-suffix {
+-    display: none;
++  .inbox-workbench {
++    flex: 0 0 auto;
++    min-height: 720px;
++    grid-template-columns: 1fr;
++    grid-template-rows: minmax(220px, 34vh) minmax(480px, 1fr);
++    overflow: visible;
+   }
+-  .composer-wrap .composer-toolbar .menu-button.loadout-button {
+-    width: 34px;
+-    padding: 0;
+-    justify-content: center;
++  .inbox-list {
++    border-right: 0;
++    border-bottom: 1px solid var(--border);
+   }
+ }
+ 
+-@container split-pane (max-height: 480px) and (max-width: 300px) {
+-  .composer-wrap .composer-toolbar .icon-btn,
+-  .composer-wrap .composer-toolbar .menu-button.loadout-button,
+-  .composer-wrap .composer-toolbar .send-btn,
+-  .composer-wrap .composer-toolbar .stop-btn {
+-    width: 28px;
+-    height: 28px;
+-    min-height: 28px;
+-  }
+-  .composer-wrap .composer-attach {
+-    transform: none;
+-  }
++@media (max-width: 520px) {
++  .inbox-head h1 { font-size: 22px; }
++  .inbox-head-actions .btn { flex: 1; }
++  .inbox-source-filters > button { flex: 1; justify-content: center; }
++  .inbox-message { width: 92%; }
++  .inbox-compose-fields { grid-template-columns: 1fr; }
++  .inbox-subject { grid-column: auto; }
++  .inbox-composer-foot { align-items: stretch; flex-direction: column; }
++  .inbox-composer-foot .btn { align-self: flex-end; }
++}
++
++/* Focused relationship navigation and readable profiles. */
++.brain-map-filters { grid-template-columns: minmax(220px, 1fr) minmax(150px, .6fr) minmax(160px, .6fr) 120px auto auto auto; }
++.brain-map-workbench { grid-template-columns: minmax(0, 1fr) 360px; min-height: 480px; }
++.brain-canvas-scroll { min-height: 420px; max-height: 65vh; overflow: auto; }
++.brain-detail-panel { max-height: calc(65vh + 46px); }
++.brain-focus-bar, .brain-profile-actions { display: flex; align-items: center; flex-wrap: wrap; gap: 10px; }
++.brain-focus-bar { padding: 12px 0; font-size: 12px; }
++.brain-focus-bar > span { color: var(--muted-foreground); }
++.brain-coverage { max-width: 980px; color: var(--muted-foreground); font-size: 11px; line-height: 1.5; margin: 0 0 14px; }
++.brain-profile-actions { margin-top: 14px; }
++.brain-profile-summary { display: grid; grid-template-columns: 1fr auto; gap: 8px; margin: 0 0 14px; font-size: 12px; }
++.brain-profile-summary dt { color: var(--muted-foreground); }
++.brain-profile-summary dd { margin: 0; font-weight: 650; }
++.brain-edge { cursor: pointer; }
++.brain-edges .brain-edge-hit { stroke: transparent; stroke-width: 16; pointer-events: stroke; }
++.brain-edge:hover path:not(.brain-edge-hit), .brain-edge:focus path:not(.brain-edge-hit) { stroke: var(--brand-accent); stroke-width: 3; opacity: 1; }
++.brain-edge:focus { outline: none; }
++.brain-node:focus-visible rect { stroke: var(--foreground); stroke-width: 3; }
++.brain-profile-expanded { display: block; }
++.brain-profile-expanded .brain-graph-panel { display: none; }
++.brain-profile-expanded .brain-detail-panel { max-height: none; display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); }
++.brain-profile-expanded .brain-detail-head { grid-column: 1 / -1; }
++.brain-profile-expanded .brain-neighbor-list { max-height: 440px; overflow: auto; }
++@media (max-width: 1100px) {
++  .brain-map-filters { grid-template-columns: 1fr 1fr 1fr auto; }
++  .brain-map-filters .brain-search { grid-column: 1 / -1; }
++  .brain-map-workbench { grid-template-columns: minmax(0, 1fr) 300px; }
++}
++@media (max-width: 760px) {
++  .brain-map-filters { grid-template-columns: 1fr 1fr; }
++  .brain-map-workbench { grid-template-columns: 1fr; }
++  .brain-detail-panel { max-height: none; }
++  .brain-profile-expanded .brain-detail-panel { display: block; }
+ }
+diff --git a/plugins/web-ui/src/shell.ts b/plugins/web-ui/src/shell.ts
+index 68330cd4..a991845b 100644
+--- a/plugins/web-ui/src/shell.ts
++++ b/plugins/web-ui/src/shell.ts
+@@ -17,7 +17,9 @@ import {
+   LogOut,
+   Menu,
+   MessageSquare,
++  Network,
+   PanelLeft,
++  Plug,
+   Plus,
+   Repeat,
+   Rocket,
+@@ -93,13 +95,15 @@ import { renderCalendar } from "./calendar";
+ import {
+   inboxOpenCount,
+   refreshInbox,
+-  renderInbox,
+   resetActiveInboxItem,
+   resetInboxState,
+   routeInboxHistory,
+ } from "./inbox";
+ import { openSkillById, renderSkills, resetActiveSkill, routeSkillsHistory } from "./skills";
+ import { applyTheme, renderSettings, watchSystemTheme } from "./settings";
++import { renderPersonalConnections, resetPersonalConnectionsState } from "./personal-connections";
++import { renderUnifiedInbox, resetUnifiedInboxState } from "./unified-inbox";
++import { renderBrainMap, resetBrainMapState } from "./brain-map";
+ import { contextsState, ensureContexts, renderContexts, resetContextsState, resolveProjectScope } from "./contexts";
+ import { appState, can, canView, isView, type AuthMode, type Me, type View } from "./shell-state";
+ import { trapDialogFocus } from "./dialog-focus";
+@@ -209,9 +213,11 @@ const ICON = {
+   inbox: InboxGlyph,
+   calendar: CalendarDays,
+   chats: MessageSquare,
++  brain: Network,
+   contexts: Folder,
+   files: Files,
+   keychain: KeyRound,
++  connections: Plug,
+   deploys: Rocket,
+   webhooks: Webhook,
+   crons: Clock,
+@@ -245,6 +251,9 @@ export async function signOut(): Promise<void> {
+   resetMemoryState();
+   resetContextsState();
+   resetKeychainState();
++  resetPersonalConnectionsState();
++  resetUnifiedInboxState();
++  resetBrainMapState();
+   mainConversation().composer.resetComposer();
+   updateDocumentTitle();
+   if (!portal) {
+@@ -298,8 +307,8 @@ function devBanner(user: string) {
+ function gateShell(body: unknown) {
+   return html`
+     <div class="signin">
+-      <div class="signin-panel">
+-        <div class="signin-brand">
++        <div class="signin-panel">
++          <div class="signin-brand">
+           ${brandMark()}<span>${brandName()}</span>
+           ${authMode === "dev" ? html`<span class="dev-chip">DEV</span>` : nothing}
+         </div>
+@@ -630,6 +639,8 @@ export function renderSidebarTop(): void {
+           hideTooltip();
+           openBrowse();
+         })}
++        ${navRow("connections", ICON.connections, "Add your own connections")}
++        ${can("admin") ? navRow("brain", ICON.brain, "Brain map") : nothing}
+       </nav>
+       <div class="nav new-chat-nav">
+         ${actionRow(ICON.newChat, newChatLabel, () => {
+@@ -701,7 +712,7 @@ export function switchView(v: View): void {
+       renderList();
+       break;
+     case "inbox":
+-      void renderInbox();
++      void renderUnifiedInbox();
+       break;
+     case "calendar":
+       renderCalendar();
+@@ -715,6 +726,9 @@ export function switchView(v: View): void {
+     case "loops":
+       void renderLoopsPage();
+       break;
++    case "brain":
++      void renderBrainMap();
++      break;
+     case "contexts":
+       void renderContexts();
+       break;
+@@ -724,6 +738,9 @@ export function switchView(v: View): void {
+     case "keychain":
+       void renderConnectors();
+       break;
++    case "connections":
++      void renderPersonalConnections();
++      break;
+     case "deploys":
+       void renderDeploys();
+       break;
+@@ -768,7 +785,7 @@ function refreshActiveView(v: View): void {
+       else void renderChatsPage();
+       break;
+     case "inbox":
+-      void renderInbox();
++      void renderUnifiedInbox();
+       break;
+     case "calendar":
+       renderCalendar();
+@@ -785,6 +802,9 @@ function refreshActiveView(v: View): void {
+     case "loops":
+       void renderLoopsPage();
+       break;
++    case "brain":
++      void renderBrainMap();
++      break;
+     case "files":
+       void renderFiles();
+       break;
+@@ -792,6 +812,9 @@ function refreshActiveView(v: View): void {
+       clearConnectorNotice();
+       void renderConnectors();
+       break;
++    case "connections":
++      void renderPersonalConnections();
++      break;
+     case "deploys":
+       void renderDeploys();
+       break;
+diff --git a/plugins/web-ui/src/unified-inbox.ts b/plugins/web-ui/src/unified-inbox.ts
+new file mode 100644
+index 00000000..f44aaa5d
+--- /dev/null
++++ b/plugins/web-ui/src/unified-inbox.ts
+@@ -0,0 +1,372 @@
++import { html, nothing, render } from "lit";
++import { ExternalLink, Inbox, Plus, RefreshCw, Search, Send, ShieldCheck } from "lucide";
++import { api } from "./core-bridge";
++import { errMessage } from "../../chassis/src/errors";
++import { appState, replacePanePreservingFocus, switchView } from "./shell";
++import { icon } from "./ui";
++
++type Source = "gmail" | "outlook" | "slack";
++
++interface Conversation {
++  id: string;
++  source: Source;
++  threadId: string;
++  channelId?: string;
++  messageId?: string;
++  title: string;
++  participant: string;
++  preview: string;
++  lastAt: string | null;
++  unread: boolean;
++  sourceUrl?: string;
++}
++
++interface Message {
++  id: string;
++  sender: string;
++  recipients: string[];
++  text: string;
++  sentAt: string | null;
++  outgoing: boolean;
++}
++
++const SOURCES: Source[] = ["gmail", "outlook", "slack"];
++const LABEL: Record<Source, string> = { gmail: "Gmail", outlook: "Outlook", slack: "Slack" };
++
++let conversations: Conversation[] = [];
++let connected: Source[] = [];
++let enabled = new Set<Source>(SOURCES);
++let selected: Conversation | null = null;
++let messages: Message[] = [];
++let query = "";
++let notice = "";
++let loading = false;
++let threadLoading = false;
++let composing = false;
++let composeSource: Source = "gmail";
++let recipient = "";
++let subject = "";
++let draft = "";
++let confirmSend = false;
++let sending = false;
++
++export function resetUnifiedInboxState(): void {
++  conversations = [];
++  connected = [];
++  enabled = new Set(SOURCES);
++  selected = null;
++  messages = [];
++  query = "";
++  notice = "";
++  loading = false;
++  threadLoading = false;
++  composing = false;
++  composeSource = "gmail";
++  recipient = "";
++  subject = "";
++  draft = "";
++  confirmSend = false;
++  sending = false;
++}
++
++function date(value: string | null): string {
++  if (!value) return "";
++  const parsed = new Date(value);
++  if (Number.isNaN(parsed.valueOf())) return "";
++  const today = new Date();
++  return parsed.toDateString() === today.toDateString()
++    ? parsed.toLocaleTimeString(undefined, { hour: "numeric", minute: "2-digit" })
++    : parsed.toLocaleDateString(undefined, { month: "short", day: "numeric" });
++}
++
++function sourceMark(source: Source) {
++  return html`<span class="inbox-source-mark ${source}" aria-label=${LABEL[source]}>${LABEL[source][0]}</span>`;
++}
++
++function extractEmail(value: string): string {
++  return value.match(/[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}/i)?.[0] ?? "";
++}
++
++function beginReply(row: Conversation): void {
++  composing = false;
++  recipient = row.source === "slack" ? row.channelId ?? "" : extractEmail(row.participant);
++  subject = row.title;
++  draft = "";
++  confirmSend = false;
++}
++
++function beginCompose(): void {
++  selected = null;
++  messages = [];
++  composing = true;
++  composeSource = connected[0] ?? "gmail";
++  recipient = "";
++  subject = "";
++  draft = "";
++  confirmSend = false;
++  draw();
++}
++
++function conversationList() {
++  if (loading) return html`<div class="inbox-list-state">Loading conversations…</div>`;
++  if (!connected.length) {
++    return html`<div class="inbox-list-state">
++      <strong>No messaging accounts connected</strong>
++      <span>Add a private work account to start.</span>
++      <button class="btn" type="button" @click=${() => switchView("connections")}>Add a connection</button>
++    </div>`;
++  }
++  if (!conversations.length) return html`<div class="inbox-list-state">No recent conversations found.</div>`;
++  return conversations.map((row) => html`
++    <button
++      type="button"
++      class="inbox-row ${selected?.id === row.id ? "active" : ""} ${row.unread ? "unread" : ""}"
++      @click=${() => void openConversation(row)}
++    >
++      <span class="inbox-row-accent ${row.source}" aria-hidden="true"></span>
++      ${sourceMark(row.source)}
++      <span class="inbox-row-copy">
++        <span class="inbox-row-top"><strong>${row.participant || LABEL[row.source]}</strong><time>${date(row.lastAt)}</time></span>
++        <span class="inbox-row-title">${row.title}</span>
++        <span class="inbox-row-preview">${row.preview || "Open conversation"}</span>
++      </span>
++    </button>`);
++}
++
++function composer(source: Source, row?: Conversation) {
++  const threaded = Boolean(row);
++  return html`<form class="inbox-composer" @submit=${(event: Event) => {
++    event.preventDefault();
++    if (!draft.trim() || (!threaded && !recipient.trim())) return;
++    confirmSend = true;
++    draw();
++  }}>
++    ${!threaded ? html`
++      <div class="inbox-compose-fields">
++        <label>Account
++          <select .value=${composeSource} @change=${(event: Event) => {
++            composeSource = (event.target as HTMLSelectElement).value as Source;
++            draw();
++          }}>
++            ${connected.map((item) => html`<option value=${item}>${LABEL[item]}</option>`)}
++          </select>
++        </label>
++        <label>${source === "slack" ? "Channel" : "To"}
++          <input required maxlength="500" .value=${recipient} @input=${(event: Event) => recipient = (event.target as HTMLInputElement).value} />
++        </label>
++        ${source !== "slack" ? html`<label class="inbox-subject">Subject
++          <input required maxlength="300" .value=${subject} @input=${(event: Event) => subject = (event.target as HTMLInputElement).value} />
++        </label>` : nothing}
++      </div>` : nothing}
++    <label class="sr-only" for="inbox-message">Message</label>
++    <textarea
++      id="inbox-message"
++      data-focus-key="inbox-message"
++      maxlength="8000"
++      placeholder=${threaded ? "Write a reply…" : "Write a message…"}
++      .value=${draft}
++      @input=${(event: Event) => {
++        draft = (event.target as HTMLTextAreaElement).value;
++        const submit = (event.currentTarget as HTMLTextAreaElement).form?.querySelector<HTMLButtonElement>(
++          'button[type="submit"]',
++        );
++        if (submit) submit.disabled = sending || !draft.trim();
++      }}
++    ></textarea>
++    <div class="inbox-composer-foot">
++      <span>${icon(ShieldCheck, 14)} Only the exact text you write here is sent.</span>
++      <button class="btn primary" type="submit" ?disabled=${sending || !draft.trim()}>${icon(Send, 14)} Review send</button>
++    </div>
++  </form>`;
++}
++
++function threadView() {
++  if (composing) {
++    return html`<section class="inbox-thread">
++      <header class="inbox-thread-head"><div><span class="inbox-kicker">New message</span><h2>${LABEL[composeSource]}</h2></div></header>
++      <div class="inbox-thread-empty">Your message stays private to this account.</div>
++      ${composer(composeSource)}
++    </section>`;
++  }
++  if (!selected) return html`<section class="inbox-thread inbox-thread-welcome">
++    ${icon(Inbox, 34)}
++    <h2>One place for your conversations</h2>
++    <p>Select a thread, or start a new message from a connected account.</p>
++  </section>`;
++  return html`<section class="inbox-thread">
++    <header class="inbox-thread-head">
++      <div>
++        <span class="inbox-kicker">${LABEL[selected.source]}</span>
++        <h2>${selected.title}</h2>
++        <p>${selected.participant}</p>
++      </div>
++      ${selected.sourceUrl ? html`<a class="icon-btn" href=${selected.sourceUrl} target="_blank" rel="noopener" aria-label="Open original conversation" title="Open original conversation">${icon(ExternalLink, 16)}</a>` : nothing}
++    </header>
++    <div class="inbox-messages" aria-live="polite">
++      ${threadLoading
++        ? html`<div class="inbox-thread-empty">Loading messages…</div>`
++        : messages.length
++          ? messages.map((message) => html`<article class="inbox-message ${message.outgoing ? "outgoing" : ""}">
++              <div class="inbox-message-meta"><strong>${message.sender || "Unknown sender"}</strong><time>${date(message.sentAt)}</time></div>
++              <p>${message.text || "No text content"}</p>
++            </article>`)
++          : html`<div class="inbox-thread-empty">No readable messages found in this thread.</div>`}
++    </div>
++    ${composer(selected.source, selected)}
++  </section>`;
++}
++
++function sendDialog() {
++  if (!confirmSend) return nothing;
++  const source = selected?.source ?? composeSource;
++  const destination = selected
++    ? selected.source === "slack" ? selected.title : selected.participant
++    : recipient;
++  return html`<div class="inbox-confirm-scrim" @click=${(event: MouseEvent) => event.target === event.currentTarget && cancelSend()}>
++    <section class="inbox-confirm" role="alertdialog" aria-modal="true" aria-labelledby="inbox-confirm-title">
++      <span class="inbox-kicker">Final check</span>
++      <h2 id="inbox-confirm-title">Send through ${LABEL[source]}?</h2>
++      <p>To: <strong>${destination}</strong></p>
++      ${source !== "slack" ? html`<p>Subject: <strong>${subject || selected?.title}</strong></p>` : nothing}
++      <div class="inbox-confirm-copy">${draft}</div>
++      <p class="inbox-confirm-warning">Do not send patient health information or credentials.</p>
++      <div class="actions">
++        <button class="btn" type="button" ?disabled=${sending} @click=${cancelSend}>Keep editing</button>
++        <button class="btn primary" type="button" ?disabled=${sending} @click=${() => void sendMessage()}>${icon(Send, 14)} ${sending ? "Sending…" : "Send now"}</button>
++      </div>
++    </section>
++  </div>`;
++}
++
++function cancelSend(): void {
++  if (sending) return;
++  confirmSend = false;
++  draw();
++}
++
++function draw(): void {
++  if (appState.currentView !== "inbox" || !appState.mainEl) return;
++  const host = document.createElement("div");
++  host.className = "pane unified-inbox-pane";
++  render(html`
++    <div class="inbox-head">
++      <div><span class="inbox-kicker">Your private communication desk</span><h1>Unified inbox</h1><p>Read and reply across your connected work accounts.</p></div>
++      <div class="inbox-head-actions">
++        <button class="btn" type="button" @click=${beginCompose} ?disabled=${!connected.length}>${icon(Plus, 15)} New message</button>
++        <button class="icon-btn" type="button" aria-label="Refresh inbox" title="Refresh inbox" @click=${() => void loadInbox()}>${icon(RefreshCw, 16)}</button>
++      </div>
++    </div>
++    <div class="inbox-toolbar">
++      <div class="inbox-source-filters" aria-label="Message sources">
++        ${SOURCES.map((source) => html`<button
++          type="button"
++          class=${enabled.has(source) ? "active" : ""}
++          aria-pressed=${enabled.has(source) ? "true" : "false"}
++          @click=${() => {
++            enabled.has(source) ? enabled.delete(source) : enabled.add(source);
++            void loadInbox();
++          }}
++        >${sourceMark(source)} ${LABEL[source]}</button>`)}
++      </div>
++      <form class="inbox-search" @submit=${(event: Event) => { event.preventDefault(); void loadInbox(); }}>
++        ${icon(Search, 16)}<label class="sr-only" for="inbox-search">Search conversations</label>
++        <input id="inbox-search" type="search" placeholder="Search conversations" .value=${query} @input=${(event: Event) => query = (event.target as HTMLInputElement).value} />
++      </form>
++    </div>
++    ${notice ? html`<div class="status inbox-notice" role="status">${notice}</div>` : nothing}
++    <div class="inbox-workbench">
++      <aside class="inbox-list" aria-label="Conversations">${conversationList()}</aside>
++      ${threadView()}
++    </div>
++    ${sendDialog()}
++  `, host);
++  replacePanePreservingFocus(host);
++}
++
++async function loadInbox(): Promise<void> {
++  if (loading) return;
++  loading = true;
++  notice = "";
++  draw();
++  try {
++    const result = await api<{ connected?: Source[]; conversations?: Conversation[]; warnings?: Source[] }>("/api/aitlas/inbox", {
++      method: "POST",
++      body: JSON.stringify({ sources: [...enabled], query: query.trim() }),
++    });
++    connected = result.connected ?? [];
++    conversations = result.conversations ?? [];
++    if (!connected.includes(composeSource)) composeSource = connected[0] ?? "gmail";
++    const warnings = result.warnings ?? [];
++    if (warnings.length) notice = `${warnings.map((source) => LABEL[source]).join(", ")} could not refresh. Other conversations are current.`;
++    if (selected) selected = conversations.find((row) => row.id === selected?.id) ?? selected;
++  } catch (error) {
++    notice = errMessage(error, "Could not load your inbox.");
++  } finally {
++    loading = false;
++    draw();
++  }
++}
++
++async function openConversation(row: Conversation): Promise<void> {
++  selected = row;
++  composing = false;
++  messages = [];
++  beginReply(row);
++  threadLoading = true;
++  notice = "";
++  draw();
++  try {
++    const result = await api<{ messages?: Message[] }>("/api/aitlas/inbox/thread", {
++      method: "POST",
++      body: JSON.stringify({ source: row.source, threadId: row.threadId, channelId: row.channelId }),
++    });
++    if (selected?.id === row.id) messages = result.messages ?? [];
++  } catch (error) {
++    notice = errMessage(error, "Could not open that conversation.");
++  } finally {
++    threadLoading = false;
++    draw();
++  }
++}
++
++async function sendMessage(): Promise<void> {
++  if (sending || !confirmSend) return;
++  sending = true;
++  draw();
++  const row = selected;
++  const source = row?.source ?? composeSource;
++  try {
++    await api("/api/aitlas/inbox/send", {
++      method: "POST",
++      body: JSON.stringify({
++        requestId: crypto.randomUUID(),
++        source,
++        confirmed: true,
++        text: draft.trim(),
++        recipient: recipient.trim(),
++        subject: (subject || row?.title || "").trim(),
++        ...(row ? { threadId: row.threadId, messageId: row.messageId, channelId: row.channelId } : {}),
++      }),
++    });
++    draft = "";
++    confirmSend = false;
++    notice = "Message sent.";
++    if (row) await openConversation(row);
++    else {
++      composing = false;
++      await loadInbox();
++    }
++  } catch (error) {
++    notice = errMessage(error, "Could not send that message.");
++    confirmSend = false;
++  } finally {
++    sending = false;
++    draw();
++  }
++}
++
++export async function renderUnifiedInbox(): Promise<void> {
++  if (appState.currentView !== "inbox") return;
++  draw();
++  await loadInbox();
++}
+diff --git a/plugins/web-ui/test/aitlas-routes.test.ts b/plugins/web-ui/test/aitlas-routes.test.ts
+new file mode 100644
+index 00000000..d7a044e2
+--- /dev/null
++++ b/plugins/web-ui/test/aitlas-routes.test.ts
+@@ -0,0 +1,163 @@
++import assert from "node:assert/strict";
++import type { IncomingMessage, ServerResponse } from "node:http";
++import { Readable } from "node:stream";
++import { after, test } from "node:test";
++import { handleAitlasRoute } from "../server/aitlas.ts";
++
++const calls: Array<{ path: string; body: string; capability: string }> = [];
++const originalFetch = globalThis.fetch;
++
++process.env.AITLAS_COMPOSIO_GATEWAY_URL = "http://localhost/api/qm/composio";
++process.env.AITLAS_BRAIN_GATEWAY_URL = "http://localhost/api/qm/brain";
++process.env.QM_MEMORY_REVIEWER = "reviewer@company.com";
++process.env.NODE_ENV = "test";
++
++globalThis.fetch = async (input, init) => {
++  const headers = new Headers(init?.headers);
++  calls.push({
++    path: String(input),
++    body: String(init?.body ?? ""),
++    capability: headers.get("x-agent-capability") ?? "",
++  });
++  const path = String(input);
++  const payload = path.endsWith("/catalog")
++    ? { toolkits: [] }
++    : path.endsWith("/graph")
++      ? { nodes: [], edges: [], links: [], records: [], sourceCount: 2 }
++    : path.endsWith("/inbox")
++      ? { connected: ["gmail"], conversations: [] }
++      : path.endsWith("/thread")
++        ? { messages: [] }
++        : path.endsWith("/send")
++          ? { status: "sent" }
++          : { connections: [] };
++  return new Response(JSON.stringify(payload), { status: 200, headers: { "content-type": "application/json" } });
++};
++
++after(() => {
++  globalThis.fetch = originalFetch;
++});
++
++const ctx = {
++  user: "alice",
++  displayName: "Alice",
++  coreFetch: async (_method: "GET" | "POST" | "PUT" | "PATCH" | "DELETE", path: string, body = "") => {
++    if (path === "/v1/session-cap") return { status: 200, text: JSON.stringify({ token: "scope-capability" }) };
++    calls.push({ path, body, capability: "" });
++    return { status: 202, text: JSON.stringify({ runId: "run-sync" }) };
++  },
++  coreFetchCap: async (_method: "GET" | "POST" | "PUT" | "PATCH" | "DELETE", path: string, body = "") => {
++    if (path === "/v1/admin/whoami") return { status: 200, text: JSON.stringify({ permissions: ["admin"] }) };
++    calls.push({ path, body, capability: "scope-capability" });
++    const recipient = JSON.parse(body || "{}") as { recipient?: string };
++    return { status: 200, text: JSON.stringify({ ok: true, deliveryId: "delivery-1", recipient: { displayName: recipient.recipient ?? "Reviewer" } }) };
++  },
++};
++
++async function request(path: string, method = "GET", body = "", requestContext = ctx): Promise<{ status: number; body: string }> {
++  const req = Readable.from(body ? [Buffer.from(body)] : []) as IncomingMessage;
++  let status = 0;
++  let responseBody = "";
++  const res = {
++    writeHead(nextStatus: number) {
++      status = nextStatus;
++      return this;
++    },
++    end(value?: string) {
++      responseBody = value ?? "";
++      return this;
++    },
++  } as unknown as ServerResponse;
++  await handleAitlasRoute(req, res, path, method, requestContext);
++  return { status, body: responseBody };
++}
++
++test("keeps the scope capability server-side for the personal catalog", async () => {
++  const response = await request("/api/aitlas/connections/catalog");
++  assert.equal(response.status, 200);
++  assert.equal(calls.find((call) => call.path.endsWith("/catalog"))?.capability, "scope-capability");
++  assert.ok(!response.body.includes("scope-capability"));
++});
++
++test("sends memory as an explicit review suggestion without writing company memory", async () => {
++  const response = await request(
++    "/api/aitlas/memory/suggest",
++    "POST",
++    JSON.stringify({ fact: "Client asked to move the meeting." }),
++  );
++  assert.equal(response.status, 200);
++  const reach = calls.find((call) => call.path === "/v1/reach");
++  assert.equal(reach?.capability, "scope-capability");
++  assert.match(reach?.body ?? "", /reviewer@company\.com/);
++  assert.match(reach?.body ?? "", /approve MEM-[A-F0-9]{8}/);
++  assert.match(reach?.body ?? "", /delivery alone changes nothing/);
++  assert.ok(!calls.some((call) => call.path.startsWith("/v1/memory/facts")));
++  const body = JSON.parse(response.body) as { reference?: string; recipient?: string };
++  assert.match(body.reference ?? "", /^MEM-[A-F0-9]{8}$/);
++  assert.equal(body.recipient, "reviewer@company.com");
++});
++
++test("keeps inbox reads and confirmed sends behind the server-side scope capability", async () => {
++  const inbox = await request("/api/aitlas/inbox", "POST", JSON.stringify({ sources: ["gmail"], query: "client" }));
++  assert.equal(inbox.status, 200);
++  const read = calls.find((call) => call.path.endsWith("/inbox"));
++  assert.equal(read?.capability, "scope-capability");
++  assert.deepEqual(JSON.parse(read?.body ?? "{}"), { sources: ["gmail"], query: "client" });
++
++  const sent = await request("/api/aitlas/inbox/send", "POST", JSON.stringify({ requestId: "request-123", source: "gmail", recipient: "client@example.test", confirmed: true, text: "Hello" }));
++  assert.equal(sent.status, 200);
++  const send = calls.find((call) => call.path.endsWith("/send"));
++  assert.equal(send?.capability, "scope-capability");
++  assert.ok(!sent.body.includes("scope-capability"));
++});
++
++test("shows an admin only the source-derived Brain Map and drops caller-selected scope fields", async () => {
++  const response = await request(
++    "/api/aitlas/brain/graph",
++    "POST",
++    JSON.stringify({ query: "Synthetic Clinic", connector: "ghl", entityType: "client", limit: 75, sourceId: "leadership-restricted", grants: ["all"] }),
++  );
++  assert.equal(response.status, 200);
++  const graph = calls.findLast((call) => call.path.endsWith("/graph"));
++  assert.equal(graph?.capability, "scope-capability");
++  assert.deepEqual(JSON.parse(graph?.body ?? "{}"), { query: "Synthetic Clinic", connector: "ghl", entityType: "client", limit: 75 });
++  assert.ok(!response.body.includes("scope-capability"));
++});
++
++test("does not expose the Brain Map route to a non-admin", async () => {
++  const nonAdminContext = {
++    ...ctx,
++    coreFetchCap: async () => ({ status: 200, text: JSON.stringify({ permissions: [] }) }),
++  };
++  const callCount = calls.length;
++  const response = await request("/api/aitlas/brain/graph", "POST", JSON.stringify({ query: "client" }), nonAdminContext);
++  assert.equal(response.status, 403);
++  assert.equal(calls.length, callCount);
++});
++
++test("returns the resolved handoff recipient and a traceable reference", async () => {
++  const response = await request(
++    "/api/aitlas/handoff",
++    "POST",
++    JSON.stringify({ recipient: "Avery", note: "Cover the client", neededBy: "2026-08-08" }),
++  );
++  assert.equal(response.status, 200);
++  const result = JSON.parse(response.body) as { recipient?: string; reference?: string };
++  assert.equal(result.recipient, "Avery");
++  assert.match(result.reference ?? "", /^HAND-[A-F0-9]{8}$/);
++  const reach = calls.findLast((call) => call.path === "/v1/reach");
++  assert.match(reach?.body ?? "", /accept HAND-[A-F0-9]{8}/);
++  assert.match(reach?.body ?? "", /complete HAND-[A-F0-9]{8}/);
++});
++
++test("queues sync in the signed-in person's own web conversation", async () => {
++  const response = await request(
++    "/api/aitlas/connections/sync",
++    "POST",
++    JSON.stringify({ toolkit: "gmail" }),
++  );
++  assert.equal(response.status, 202);
++  const turn = calls.find((call) => call.path.startsWith("/v1/turns"));
++  assert.match(turn?.body ?? "", /web:alice:connections/);
++  assert.match(turn?.body ?? "", /three-hour incremental sync/);
++});
+diff --git a/plugins/web-ui/test/brain-map-render.test.ts b/plugins/web-ui/test/brain-map-render.test.ts
+new file mode 100644
+index 00000000..cf623134
+--- /dev/null
++++ b/plugins/web-ui/test/brain-map-render.test.ts
+@@ -0,0 +1,137 @@
++import assert from "node:assert/strict";
++import { test } from "node:test";
++import { fileURLToPath } from "node:url";
++import { JSDOM } from "jsdom";
++import { createServer } from "vite";
++
++test("Brain Map renders SVG relationships and supports node selection", async () => {
++  const dom = new JSDOM('<!doctype html><div id="app"></div><main id="main"></main>', { url: "http://localhost/brain" });
++  Object.defineProperty(dom.window, "matchMedia", { value: () => ({ matches: false, addEventListener() {}, removeEventListener() {} }) });
++  const globals = {
++    window: dom.window, document: dom.window.document, location: dom.window.location,
++    history: dom.window.history, localStorage: dom.window.localStorage, navigator: dom.window.navigator,
++    HTMLElement: dom.window.HTMLElement, HTMLDialogElement: dom.window.HTMLDialogElement,
++    customElements: dom.window.customElements, Node: dom.window.Node, Event: dom.window.Event,
++    MouseEvent: dom.window.MouseEvent, SubmitEvent: dom.window.SubmitEvent, InputEvent: dom.window.InputEvent,
++    requestAnimationFrame: (callback: FrameRequestCallback) => setTimeout(() => callback(Date.now()), 0),
++    cancelAnimationFrame: clearTimeout, getComputedStyle: dom.window.getComputedStyle.bind(dom.window),
++  };
++  const previous = new Map(Object.keys(globals).map((key) => [key, Object.getOwnPropertyDescriptor(globalThis, key)]));
++  const originalFetch = globalThis.fetch;
++  for (const [key, value] of Object.entries(globals)) Object.defineProperty(globalThis, key, { configurable: true, writable: true, value });
++  globalThis.fetch = async (input) => {
++    assert.equal(String(input), "/api/aitlas/brain/graph");
++    return Response.json({
++      nodes: [
++        { id: "person-1", type: "person", authority: "operational", label: "Example teammate" },
++        { id: "client-1", type: "client", authority: "operational", label: "Example client" },
++      ],
++      edges: [{ id: "edge-1", from: "person-1", to: "client-1", type: "assigned-to", confidence: 1, provenance: "fixture", operational: true }],
++      links: [], records: [], sourceCount: 1, topologyStatus: "current",
++    });
++  };
++  const vite = await createServer({ root: fileURLToPath(new URL("../", import.meta.url)), server: { middlewareMode: true, hmr: false }, appType: "custom" });
++  try {
++    const { appState } = await vite.ssrLoadModule("/src/shell-state.ts");
++    const { renderBrainMap } = await vite.ssrLoadModule("/src/brain-map.ts");
++    appState.me = { user: "owner", org: "example" };
++    appState.currentView = "brain";
++    appState.mainEl = document.querySelector("#main");
++    await renderBrainMap();
++    const model = await vite.ssrLoadModule("/src/brain-map-model.ts");
++    const canvas = document.querySelector("svg.brain-canvas")!;
++    assert.ok(canvas);
++    assert.equal(canvas.querySelectorAll(".brain-node").length, 2);
++    assert.equal(canvas.querySelectorAll(".brain-edge").length, 1);
++    for (const element of canvas.querySelectorAll("*")) {
++      assert.equal(element.namespaceURI, "http://www.w3.org/2000/svg", `${element.tagName} must be SVG to paint`);
++    }
++    canvas.querySelector(".brain-node-person")!.dispatchEvent(new dom.window.MouseEvent("click", { bubbles: true }));
++    assert.match(document.querySelector(".brain-detail-panel")!.textContent!, /Example teammate/);
++    assert.match(document.querySelector(".brain-neighbor-list")!.textContent!, /Example client/);
++    document.querySelector(".brain-node-client")!.dispatchEvent(new dom.window.KeyboardEvent("keydown", { key: "Enter", bubbles: true }));
++    assert.match(document.querySelector(".brain-detail-head h2")!.textContent!, /Example client/);
++    const button = (text: string) => [...document.querySelectorAll<HTMLButtonElement>("button")].find(el => el.textContent?.includes(text))!;
++    button("Expand profile").click();
++    assert.ok(document.querySelector(".brain-profile-expanded"));
++    button("Previous profile").click();
++    assert.match(document.querySelector(".brain-detail-head h2")!.textContent!, /Example teammate/);
++    button("Back to map").click();
++    document.querySelector(".brain-edge")!.dispatchEvent(new dom.window.KeyboardEvent("keydown", { key: "Enter", bubbles: true }));
++    assert.match(document.querySelector(".brain-detail-head h2")!.textContent!, /Assigned To/);
++    button("Open Example client profile").click();
++    assert.match(document.querySelector(".brain-detail-head h2")!.textContent!, /Example client/);
++
++    const node = (id: string, type: string, connector?: string) => ({ id, type, label: id, authority: "aios", operational: true, connector });
++    const edge = (from: string, to: string) => ({ id: from + to, from, to, type: "managed-by", confidence: 1, provenance: "aios", operational: true });
++    const fixture = model.withEvidenceEdges({
++      nodes: [node("Alex","person"),node("Blair","person"),node("A","client"),node("B","client"),node("C","client"),node("Operations","department"),node("Fathom","tool-account"),node("Google","tool-account","google-ads")],
++      edges: [edge("Alex","A"),edge("Alex","B"),edge("Blair","C"),edge("Alex","Operations"),edge("Blair","Operations"),edge("B","Google")],
++      links: [
++        { recordId:"r1",entityId:"A",type:"for-client",confidence:1,provenance:"aios-mapped" },
++        { recordId:"r1",entityId:"Fathom",type:"uses-tool",confidence:1,provenance:"connector-profile" },
++        { recordId:"r2",entityId:"Operations",type:"in-department",confidence:.8,provenance:"connector-profile" },
++        { recordId:"r2",entityId:"Fathom",type:"uses-tool",confidence:1,provenance:"connector-profile" },
++      ],
++      records: [
++        {id:"r1",connector:"fathom",title:"Verified client meeting",sourceId:"owner"},
++        {id:"r2",connector:"fathom",title:"B C mentioned but unmapped",sourceId:"owner"},
++      ], sourceCount:1
++    });
++    const filters = {person:"Alex",selectedId:"Alex",connector:"fathom",query:"",entityType:"client"};
++    let view = model.visibleGraph(fixture, filters);
++    assert.deepEqual(view.nodes.map((n: any) => n.id).sort(), ["A","Alex","Fathom"]);
++    assert.equal(view.edges.length, 2, "person-client-tool path is preserved");
++    assert.ok(!view.nodes.some((n: any) => ["B","C","Blair","Operations"].includes(n.id)), "shared department is not tool evidence");
++    view = model.visibleGraph(fixture, {...filters,connector:"",entityType:""});
++    assert.ok(view.nodes.some((n: any) => n.id === "B"));
++    assert.ok(!view.nodes.some((n: any) => n.id === "Blair" || n.id === "C"));
++    view = model.visibleGraph(fixture, {...filters,person:"Blair",selectedId:"Blair"});
++    assert.equal(view.nodes.length, 0, "no fabricated Fathom match from title or department");
++    assert.equal(model.safeSourceUrl("javascript:alert(1)"), null);
++    assert.equal(model.safeSourceUrl("https://user:pass@example.com"), null);
++    assert.equal(model.safeSourceUrl("https://example.com/meeting"), "https://example.com/meeting");
++    globalThis.fetch = async () => Response.json(fixture);
++    const { resetBrainMapState } = await vite.ssrLoadModule("/src/brain-map.ts");
++    resetBrainMapState();
++    await renderBrainMap();
++    const choose = (label: string, value: string) => {
++      const select = document.querySelector<HTMLSelectElement>('select[aria-label="' + label + '"]')!;
++      select.value = value;
++      select.dispatchEvent(new dom.window.Event("change", {bubbles:true}));
++    };
++    choose("Teammate filter", "Alex");
++    assert.equal(document.querySelectorAll(".brain-node-person").length, 1);
++    assert.match(document.querySelector(".brain-detail-head h2")!.textContent!, /Alex/);
++    assert.equal(document.querySelector<HTMLSelectElement>('select[aria-label="Teammate filter"]')!.value, "Alex");
++    choose("Tool or evidence filter", "fathom");
++    await new Promise(resolve => setTimeout(resolve, 20));
++    assert.equal(document.querySelector<HTMLSelectElement>('select[aria-label="Tool or evidence filter"]')!.value, "fathom");
++    choose("Entity type", "client");
++    assert.equal(document.querySelector<HTMLSelectElement>('select[aria-label="Entity type"]')!.value, "client");
++    assert.equal(document.querySelectorAll(".brain-node-client").length, 1);
++    assert.match(document.querySelector(".brain-focus-bar")!.textContent!, /1 matching clients for Fathom/);
++    choose("Teammate filter", "Blair");
++    assert.match(document.querySelector(".brain-detail-head h2")!.textContent!, /Blair/);
++    assert.equal(document.querySelectorAll(".brain-node-client").length, 0);
++    assert.match(document.querySelector(".brain-focus-bar")!.textContent!, /0 matching clients/);
++    choose("Tool or evidence filter", "");
++    await new Promise(resolve => setTimeout(resolve, 20));
++    assert.equal(document.querySelectorAll(".brain-node-client").length, 1);
++    // A failed refresh removes the prior successful graph instead of presenting stale evidence.
++    globalThis.fetch = async () => { throw new Error("offline"); };
++    await renderBrainMap();
++    assert.equal(document.querySelectorAll(".brain-node").length, 0);
++    assert.match(document.querySelector('[role="status"]')!.textContent!, /offline/);
++
++
++  } finally {
++    await vite.close();
++    dom.window.close();
++    globalThis.fetch = originalFetch;
++    for (const [key, descriptor] of previous) {
++      if (descriptor) Object.defineProperty(globalThis, key, descriptor);
++      else Reflect.deleteProperty(globalThis, key);
++    }
++  }
++});

@@ -32,7 +32,12 @@ a live deployment and must never be pointed at ChiroCandy accounts or resources.
 - `connector-gateway/` is a deployable customer-owned gateway; its secrets live
   only in the customer's Fly secret store.
 - `patches/` and `assets/` reproduce the AitlasQM Connections and Unified Inbox
-  web surface from reviewed upstream QM source.
+  web surface from reviewed upstream QM source. The active patch series is
+  `patches/qm-web-ui-v0.1.12/`; older patches are historical only.
+- `room-skills/` holds opt-in native room examples; it is not an automatic
+  sandbox skill import.
+- `docs/COMPANY-BRAIN-ADOPTION.md` documents the safe integration boundary.
+  The private ChiroCandy Brain service is not part of this public template.
 
 QM runtime source belongs upstream at https://github.com/yc-software/qm. Do not
 vendor or fork the runtime into this deployment repository.

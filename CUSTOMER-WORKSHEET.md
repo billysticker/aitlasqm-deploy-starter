@@ -39,6 +39,9 @@ in the customer's ignored `.env` file or provider secret manager.
 | Bot display name | |
 | SSO app display name | |
 | Slack bot required now? | Yes / No |
+| Specialist rooms and room owners | |
+| Which room skills to publish | |
+| Image provider, allowed models, and room-only credential owner | |
 
 ## Model and data boundary
 
@@ -65,6 +68,20 @@ in the customer's ignored `.env` file or provider secret manager.
 | Unified Inbox send enabled? | Yes / No |
 | Controlled recipient for send acceptance | |
 | Gateway monitoring/incident owner | |
+
+## Optional Company Brain
+
+The external knowledge service is not deployed by this starter. If chosen,
+record the customer-owned service and follow
+[`docs/COMPANY-BRAIN-ADOPTION.md`](./docs/COMPANY-BRAIN-ADOPTION.md).
+
+| Decision | Customer answer |
+|---|---|
+| Knowledge provider and database owner | |
+| Personal, company, restricted, and client source grants | |
+| CRM or operations system that owns roles and assignments | |
+| Reviewer for private-to-company promotion | |
+| Two-user, two-client isolation proof owner | |
 
 ## Acceptance owner
 

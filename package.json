@@ -3,7 +3,7 @@
   "version": "0.0.0",
   "private": true,
   "dependencies": {
-    "@yc-software/qm": "0.1.4"
+    "@yc-software/qm": "0.1.12"
   },
   "engines": {
     "node": ">=24.0.0"
@@ -15,6 +15,8 @@
     "deploy": "qm up",
     "status": "qm status",
     "conformance": "qm conformance --static",
+    "env:check": "node scripts/sync-env-example.mjs",
+    "env:sync": "node scripts/sync-env-example.mjs --write",
     "starter:audit": "node scripts/audit-starter.mjs",
     "test:composio": "node --test test/composio-client.test.mjs",
     "gateway:install": "npm --prefix connector-gateway ci",
